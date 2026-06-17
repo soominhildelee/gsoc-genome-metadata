@@ -1,0 +1,237 @@
+import argparse
+import json
+
+from fetch import fetch_papers_for_assembly
+from parse import parse_paper
+from extract import extract_metadata
+from search import run_vector_search
+
+# ============================================================
+# Paper quality filter
+# ============================================================
+
+EXCLUDE_KEYWORDS = [
+    "chloroplast", "mitochondria", "organelle",
+    "plastid", "cpdna", "mtdna", "plastome",
+]
+
+def is_nuclear_genome_paper(paper: dict) -> bool:
+    title    = paper.get("title", "").lower()
+    text     = paper.get("text_data", {}).get("text") or ""
+    abstract = text[:500].lower()  # check first 500 chars only
+
+    return not any(
+        kw in title or kw in abstract
+        for kw in EXCLUDE_KEYWORDS
+    )
+
+
+def select_best_paper(papers: list[dict]) -> dict | None:
+    # Priority 1: fulltext + nuclear genome
+    for paper in papers:
+        if (paper["text_data"]["source"] == "fulltext"
+                and is_nuclear_genome_paper(paper)):
+            print(f"  Selected (fulltext, nuclear): {paper['title'][:70]}...")
+            return paper
+
+    # Priority 2: abstract + nuclear genome
+    for paper in papers:
+        if (paper["text_data"]["source"] in ("abstract", "search_result")
+                and is_nuclear_genome_paper(paper)):
+            print(f"  Selected (abstract, nuclear): {paper['title'][:70]}...")
+            return paper
+
+    # Priority 3: fulltext (any — organelle as last resort)
+    for paper in papers:
+        if paper["text_data"]["source"] == "fulltext":
+            print(f"  Selected (fulltext, organelle — no better option): {paper['title'][:70]}...")
+            return paper
+
+    # Priority 4: abstract (any)
+    for paper in papers:
+        if paper["text_data"]["source"] in ("abstract", "search_result"):
+            print(f"  Selected (abstract, organelle — no better option): {paper['title'][:70]}...")
+            return paper
+
+    # Priority 5: first paper
+    if papers:
+        print(f"  Selected (fallback): {papers[0]['title'][:70]}...")
+        return papers[0]
+
+    return None
+
+
+# ============================================================
+# MAIN FUNCTION — run full pipeline for one assembly accession
+#           input:  assembly accession string
+#           output: final metadata dict
+# ============================================================
+
+def run_pipeline(accession: str, max_results: int = 5) -> dict:
+    print("=" * 60)
+    print(f"Pipeline started for: {accession}")
+    print("=" * 60)
+
+    # ── Step 1: fetch ─────────────────────────────────────────
+    print("\n[Step 1/4] Fetching assembly metadata and papers ...")
+    fetched  = fetch_papers_for_assembly(accession, max_results=max_results)
+    assembly = fetched["assembly"]
+    papers   = fetched["papers"]
+
+    if not papers:
+        print("  No papers found. Returning assembly metadata only.")
+        return {
+            "assembly_accession": assembly.get("assembly_accession"),
+            "assembly_name":      assembly.get("assembly_name"),
+            "taxon_id":           assembly.get("taxon_id"),
+            "scientific_name":    assembly.get("scientific_name"),
+            "chromosome_number":  {
+                "value":  assembly.get("chromosome_number"),
+                "source": assembly.get("chromosome_source"),
+            },
+            "ploidy":    {"value": "unknown", "confidence": 0.0},
+            "cultivars": {"confirmed": [], "unconfirmed": []},
+            "sex":       {"value": "unknown"},
+            "papers_found": 0,
+        }
+
+    # Select best paper — prefer nuclear genome + fulltext
+    print(f"\n  Selecting best paper from {len(papers)} candidate(s) ...")
+    best_paper = select_best_paper(papers)
+
+    if best_paper is None:
+        print("  No usable paper found.")
+        return {
+            "assembly_accession": assembly.get("assembly_accession"),
+            "error":              "no_usable_paper",
+        }
+
+    print(f"  Text source: {best_paper['text_data']['source']}")
+    print(f"  Validated:   "
+          f"PMCID={best_paper['validation']['pmcid_valid']} "
+          f"PMID={best_paper['validation']['pmid_valid']}")
+
+    # ── Step 2: parse ─────────────────────────────────────────
+    print("\n[Step 2/4] Parsing paper text into sections ...")
+    parsed = parse_paper(best_paper["text_data"])
+
+    if parsed["n_sections"] == 0:
+        print("  No sections extracted. Check text source.")
+        return {
+            "assembly_accession": assembly.get("assembly_accession"),
+            "assembly_name":      assembly.get("assembly_name"),
+            "taxon_id":           assembly.get("taxon_id"),
+            "error":              "no_sections_extracted",
+        }
+
+    print(f"  Sections: {parsed['n_sections']}  Chunks: {parsed['n_chunks']}")
+
+    # ── Step 3: rule-based extraction ─────────────────────────
+    print("\n[Step 3/4] Running rule-based extraction ...")
+    rule_result = extract_metadata(parsed, assembly, paper_title=best_paper.get("title"))
+
+    # ── Step 4: vector search + ensemble ──────────────────────
+    print("\n[Step 4/4] Running vector search and ensemble ...")
+    final = run_vector_search(parsed, rule_result)
+
+    # Add paper-level metadata to final output
+    final["paper"] = {
+        "title":       best_paper["title"],
+        "pmcid":       best_paper["pmcid"],
+        "pmid":        best_paper["pmid"],
+        "doi":         best_paper["doi"],
+        "text_source": best_paper["text_data"]["source"],
+        "validation":  best_paper["validation"],
+    }
+    final["papers_found"] = len(papers)
+
+    return final
+
+
+# ============================================================
+# BATCH MODE — run pipeline for multiple accessions
+#           input:  list of accession strings
+#           output: list of final metadata dicts
+# ============================================================
+
+def run_batch(accessions: list[str], max_results: int = 5) -> list[dict]:
+    results = []
+    total   = len(accessions)
+
+    for i, accession in enumerate(accessions, 1):
+        print(f"\n{'=' * 60}")
+        print(f"Batch progress: {i}/{total}")
+        try:
+            result         = run_pipeline(accession, max_results=max_results)
+            result["status"] = "success"
+        except Exception as e:
+            print(f"  ERROR for {accession}: {e}")
+            result = {
+                "assembly_accession": accession,
+                "status":             "error",
+                "error":              str(e),
+            }
+        results.append(result)
+
+    print(f"\n{'=' * 60}")
+    print(f"Batch complete: {len(results)} accessions processed")
+    successful = sum(1 for r in results if r.get("status") == "success")
+    print(f"  Successful: {successful}/{total}")
+    print(f"  Failed:     {total - successful}/{total}")
+
+    return results
+
+
+# ============================================================
+# CLI entry point
+# ============================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Extract genomic metadata from an assembly accession."
+    )
+    parser.add_argument(
+        "--accession",
+        type=str,
+        help="Single NCBI assembly accession (e.g. GCA_003086295.3)",
+    )
+    parser.add_argument(
+        "--batch",
+        type=str,
+        help="Path to a text file with one accession per line (batch mode)",
+    )
+    parser.add_argument(
+        "--max_results",
+        type=int,
+        default=5,
+        help="Max number of papers to fetch per accession (default: 5)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Path to save results as JSON (optional)",
+    )
+    args = parser.parse_args()
+
+    if args.accession:
+        result = run_pipeline(args.accession, max_results=args.max_results)
+        if args.output:
+            with open(args.output, "w") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"\nResults saved to {args.output}")
+
+    elif args.batch:
+        with open(args.batch) as f:
+            accessions = [line.strip() for line in f if line.strip()]
+        print(f"Batch mode: {len(accessions)} accessions loaded from {args.batch}")
+        results = run_batch(accessions, max_results=args.max_results)
+        if args.output:
+            with open(args.output, "w") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            print(f"\nResults saved to {args.output}")
+        else:
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+
+    else:
+        parser.print_help()

@@ -9,22 +9,25 @@ from pipeline import run_pipeline
 
 TEST_CASES = [
     {
-        "accession":        "GCA_000001735.2",
-        "description":      "Arabidopsis thaliana — well-known diploid model plant",
-        "expected_ploidy":  "diploid",
-        "expected_species": "Arabidopsis thaliana",
+        "accession":          "GCA_000001735.2",
+        "description":        "Arabidopsis thaliana — well-known diploid model plant",
+        "expected_level":     2,
+        "expected_mechanism": {None},
+        "expected_species":   "Arabidopsis thaliana",
     },
     {
-        "accession":        "GCA_003086295.3",
-        "description":      "Arachis hypogaea (peanut) — allotetraploid",
-        "expected_ploidy":  "tetraploid",
-        "expected_species": "Arachis hypogaea",
+        "accession":          "GCA_003086295.3",
+        "description":        "Arachis hypogaea (peanut) — segmental allotetraploid",
+        "expected_level":     4,
+        "expected_mechanism": {"segmental_allopolyploid", "allopolyploid", None},
+        "expected_species":   "Arachis hypogaea",
     },
     {
-        "accession":        "GCA_002220415.3",  # 변경 — Triticum_4.0, 논문 연결 더 좋음
-        "description":      "Triticum aestivum (wheat) — hexaploid",
-        "expected_ploidy":  "hexaploid",
-        "expected_species": "Triticum aestivum",
+        "accession":          "GCA_002220415.3",
+        "description":        "Triticum aestivum (wheat) — hexaploid (amphidiploid)",
+        "expected_level":     6,
+        "expected_mechanism": {"allopolyploid", "amphidiploid", None},
+        "expected_species":   "Triticum aestivum",
     },
 ]
 
@@ -32,11 +35,19 @@ TEST_CASES = [
 def check_result(result: dict, expected: dict) -> dict:
     checks = {}
 
-    got_ploidy = result.get("ploidy", {}).get("value", "unknown")
-    checks["ploidy"] = {
-        "expected": expected["expected_ploidy"],
-        "got":      got_ploidy,
-        "ok":       got_ploidy == expected["expected_ploidy"],
+    ploidy     = result.get("ploidy", {})
+    got_level  = ploidy.get("level")
+    got_mech   = ploidy.get("mechanism")
+    checks["ploidy_level"] = {
+        "expected": expected["expected_level"],
+        "got":      got_level,
+        "ok":       got_level == expected["expected_level"],
+    }
+    # mechanism is informational (not a hard pass/fail) but flagged if unexpected
+    checks["ploidy_mechanism"] = {
+        "expected": sorted(str(m) for m in expected["expected_mechanism"]),
+        "got":      got_mech,
+        "ok":       got_mech in expected["expected_mechanism"],
     }
 
     got_species = result.get("species", {}).get("value", "unknown")
@@ -60,7 +71,10 @@ def check_result(result: dict, expected: dict) -> dict:
         "ok":       result.get("papers_found", 0) > 0,
     }
 
-    passed = all(c["ok"] for c in checks.values())
+    # Pass criterion: level + species + accession + paper_found.
+    # (mechanism is reported but does not fail the test by itself.)
+    hard = ["ploidy_level", "species", "accession", "paper_found"]
+    passed = all(checks[k]["ok"] for k in hard)
     return {"passed": passed, "checks": checks}
 
 

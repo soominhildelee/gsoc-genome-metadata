@@ -7,8 +7,8 @@ import pandas as pd
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
-# Shared ploidy classifier — keeps rule-based and vector stages consistent
-from extract import find_ploidy_mentions
+# Shared ploidy logic — keeps rule-based and vector stages consistent
+from extract import resolve_ploidy_fields, _LEVEL_LABEL
 
 # ============================================================
 # Configuration
@@ -189,60 +189,19 @@ _COMPOUND_BOOST = 6.0
 _FORMULA_BOOST  = 10.0
 
 
-def infer_ploidy(results: list[dict]) -> dict:
-    """Ploidy from retrieved chunks, using the SAME ancestor-aware
-    classifier as the rule-based stage (extract.find_ploidy_mentions).
-
-    Bare diploid/polyploid mentions in an ancestor/progenitor context are
-    ignored; compound (allo/auto) terms and 2n=Nx formulas dominate. This
-    prevents an allotetraploid's diploid ancestors from out-voting the
-    organism's own ploidy.
+def infer_ploidy(results: list) -> dict:
+    """Ploidy (INSDC schema tuple) from retrieved chunks, using the SAME
+    resolver as the rule-based stage (extract.resolve_ploidy_fields) so both
+    stages apply identical ancestor-aware, compound-aware logic.
     """
-    counts:        dict[str, float] = {}
-    best_evidence: dict[str, dict]  = {}
-
+    segments = []
     for r in results:
-        sec_weight = get_section_weight(r["section"])
-        if sec_weight == 0.0:
+        w = get_section_weight(r["section"])
+        if w == 0.0:
             continue
-
-        for men in find_ploidy_mentions(r["text"]):
-            if men["is_ancestor"]:
-                continue  # ancestor/progenitor — not the organism
-
-            if men["is_formula"]:
-                w = sec_weight * _FORMULA_BOOST
-            elif men["is_compound"]:
-                w = sec_weight * _COMPOUND_BOOST
-            else:
-                w = sec_weight
-
-            counts[men["value"]] = counts.get(men["value"], 0.0) + w
-
-            cur = best_evidence.get(men["value"])
-            if cur is None or men["is_formula"] or men["is_compound"]:
-                best_evidence[men["value"]] = {
-                    "keyword":   men["match"],
-                    "context":   men["context"],
-                    "section":   r["section"],
-                    "rrf_score": r["score"],
-                }
-
-    if not counts:
-        return {"value": "unknown", "confidence": 0.0, "evidence": None}
-
-    best           = max(counts, key=counts.get)
-    total          = sum(counts.values())
-    base_conf      = round(counts[best] / total, 2)
-    priority_bonus = 0.1 if best_evidence.get(best, {}).get("section", "").lower() in PRIORITY_SECTIONS else 0.0
-    confidence     = min(round(base_conf + priority_bonus, 2), 0.95)
-
-    return {
-        "value":      best,
-        "confidence": confidence,
-        "evidence":   best_evidence.get(best),
-        "all_counts": {k: round(v, 2) for k, v in counts.items() if v > 0},
-    }
+        is_priority = any(p in r["section"].lower() for p in PRIORITY_SECTIONS)
+        segments.append((r["text"], w, is_priority))
+    return resolve_ploidy_fields(segments)
 
 
 def infer_sex(results: list[dict]) -> dict:
@@ -299,56 +258,64 @@ def infer_strain(results: list[dict]) -> dict:
 # STEP 6 — Ensemble: combine rule-based + vector results
 # ============================================================
 
+_MECH_SPEC = {"amphidiploid": 3, "segmental_allopolyploid": 3,
+              "allopolyploid": 1, "autopolyploid": 1}
+
+def _merge_mechanism(a, b):
+    cands = [m for m in (a, b) if m]
+    if not cands:
+        return None
+    return max(cands, key=lambda m: _MECH_SPEC.get(m, 0))
+
+
 def ensemble_ploidy(rule_result: dict, vector_result: dict) -> dict:
-    r_val  = rule_result.get("value", "unknown")
-    v_val  = vector_result.get("value", "unknown")
+    """Combine rule-based and vector ploidy on the `level` field, merging the
+    other schema elements (mechanism / irregular / derivation)."""
+    r_lvl  = rule_result.get("level")
+    v_lvl  = vector_result.get("level")
     r_conf = rule_result.get("confidence", 0.0)
     v_conf = vector_result.get("confidence", 0.0)
 
-    if r_val == "unknown" and v_val == "unknown":
+    mechanism  = _merge_mechanism(rule_result.get("mechanism"), vector_result.get("mechanism"))
+    irregular  = rule_result.get("irregular") or vector_result.get("irregular") or False
+    derivation = rule_result.get("derivation") or vector_result.get("derivation")
+
+    def out(level, conf, method, evidence):
+        mech = mechanism
+        if level == 1:
+            mech = None
+        elif level is not None and level < 3:
+            mech = None
         return {
-            "value":      "unknown",
-            "confidence": 0.0,
-            "method":     "both_unknown",
-            "evidence":   None,
+            "level":       level,
+            "mechanism":   mech,
+            "irregular":   irregular,
+            "derivation":  derivation,
+            "tuple":       [level, mech, irregular, derivation],
+            "level_label": _LEVEL_LABEL.get(level) if level is not None else None,
+            "confidence":  conf,
+            "method":      method,
+            "evidence":    evidence,
         }
-    elif r_val == v_val:
-        return {
-            "value":      v_val,
-            "confidence": min(round((r_conf + v_conf) / 2 + 0.1, 2), 0.95),
-            "method":     "consensus",
-            "evidence":   vector_result.get("evidence"),
-        }
-    elif r_val == "unknown":
-        return {
-            "value":      v_val,
-            "confidence": round(v_conf * 0.9, 2),
-            "method":     "vector_only",
-            "evidence":   vector_result.get("evidence"),
-        }
-    elif v_val == "unknown":
-        return {
-            "value":      r_val,
-            "confidence": round(r_conf * 0.9, 2),
-            "method":     "rule_only",
-            "evidence":   {"context": rule_result.get("best_evidence", "")},
-        }
+
+    if r_lvl is None and v_lvl is None:
+        if mechanism:
+            return out(None, max(r_conf, v_conf, 0.4), "mechanism_only",
+                       rule_result.get("evidence") or vector_result.get("evidence"))
+        return out(None, 0.0, "both_unknown", None)
+    elif r_lvl == v_lvl:
+        return out(r_lvl, min(round((r_conf + v_conf) / 2 + 0.1, 2), 0.95),
+                   "consensus", rule_result.get("evidence"))
+    elif r_lvl is None:
+        return out(v_lvl, round(v_conf * 0.9, 2), "vector_only", vector_result.get("evidence"))
+    elif v_lvl is None:
+        return out(r_lvl, round(r_conf * 0.9, 2), "rule_only", rule_result.get("evidence"))
     else:
-        # Conflict — penalise confidence, pick higher-confidence result
+        # Conflict — penalise confidence, pick higher-confidence level
         if r_conf >= v_conf:
-            return {
-                "value":      r_val,
-                "confidence": round(r_conf * 0.8, 2),
-                "method":     "rule_wins (conflict)",
-                "evidence":   {"context": rule_result.get("best_evidence", "")},
-            }
+            return out(r_lvl, round(r_conf * 0.8, 2), "rule_wins (conflict)", rule_result.get("evidence"))
         else:
-            return {
-                "value":      v_val,
-                "confidence": round(v_conf * 0.8, 2),
-                "method":     "vector_wins (conflict)",
-                "evidence":   vector_result.get("evidence"),
-            }
+            return out(v_lvl, round(v_conf * 0.8, 2), "vector_wins (conflict)", vector_result.get("evidence"))
 
 
 def ensemble_cultivars(
@@ -396,7 +363,9 @@ def ensemble_sex(rule_sex: dict, vector_sex: dict) -> dict:
 # ============================================================
 
 QUERIES = {
-    "ploidy":  "ploidy level diploid tetraploid hexaploid chromosome number 2n",
+    "ploidy":  "ploidy level diploid triploid tetraploid hexaploid polyploid "
+               "allopolyploid autopolyploid amphidiploid whole genome duplication "
+               "chromosome number 2n 4x 6x",
     "strain":  "cultivar strain ecotype variety accession",
     "sex":     "female male sex chromosome XY ZW dioecious",
     "species": "scientific name genus species organism",
@@ -460,8 +429,8 @@ def run_vector_search(parsed: dict, rule_result: dict) -> dict:
     print(f"  species            = {final['species']['value']} "
           f"(source: {final['species']['source']})")
     p = final["ploidy"]
-    print(f"  ploidy             = {p['value']} "
-          f"(confidence: {p['confidence']}, method: {p['method']})")
+    print(f"  ploidy             = {p['tuple']} "
+          f"(level={p['level']}, confidence: {p['confidence']}, method: {p['method']})")
     c = final["chromosome_number"]
     print(f"  chromosome_number  = {c['value']} (source: {c['source']})")
     print(f"  cultivars          = {final['cultivars']['confirmed']}")

@@ -27,38 +27,32 @@ def is_nuclear_genome_paper(paper: dict) -> bool:
 
 
 def select_best_paper(papers: list[dict]) -> dict | None:
-    # Priority 1: fulltext + nuclear genome
-    for paper in papers:
-        if (paper["text_data"]["source"] == "fulltext"
-                and is_nuclear_genome_paper(paper)):
-            print(f"  Selected (fulltext, nuclear): {paper['title'][:70]}...")
-            return paper
+    # Candidates arrive pre-sorted by relevance_score (desc) from fetch.py.
+    # We pick the highest-relevance paper that has usable text. relevance_score
+    # already rewards genome/ploidy/name signals and heavily penalises organelle
+    # papers, so it is a better selector than "any fulltext first".
+    usable = [
+        p for p in papers
+        if p.get("text_data", {}).get("source") in ("fulltext", "abstract", "search_result")
+    ]
+    if not usable:
+        if papers:
+            print(f"  Selected (fallback, no usable text): {papers[0].get('title', '')[:70]}...")
+            return papers[0]
+        return None
 
-    # Priority 2: abstract + nuclear genome
-    for paper in papers:
-        if (paper["text_data"]["source"] in ("abstract", "search_result")
-                and is_nuclear_genome_paper(paper)):
-            print(f"  Selected (abstract, nuclear): {paper['title'][:70]}...")
-            return paper
+    # Rank by relevance_score; tie-break prefers fulltext over abstract.
+    def rank(p):
+        return (
+            p.get("relevance_score", 0.0),
+            1 if p.get("text_data", {}).get("source") == "fulltext" else 0,
+        )
 
-    # Priority 3: fulltext (any — organelle as last resort)
-    for paper in papers:
-        if paper["text_data"]["source"] == "fulltext":
-            print(f"  Selected (fulltext, organelle — no better option): {paper['title'][:70]}...")
-            return paper
-
-    # Priority 4: abstract (any)
-    for paper in papers:
-        if paper["text_data"]["source"] in ("abstract", "search_result"):
-            print(f"  Selected (abstract, organelle — no better option): {paper['title'][:70]}...")
-            return paper
-
-    # Priority 5: first paper
-    if papers:
-        print(f"  Selected (fallback): {papers[0]['title'][:70]}...")
-        return papers[0]
-
-    return None
+    best = max(usable, key=rank)
+    print(f"  Selected (score {best.get('relevance_score')}, "
+          f"{best.get('retrieval_source')}, {best['text_data']['source']}): "
+          f"{best.get('title', '')[:60]}...")
+    return best
 
 
 # ============================================================
@@ -136,12 +130,14 @@ def run_pipeline(accession: str, max_results: int = 5) -> dict:
 
     # Add paper-level metadata to final output
     final["paper"] = {
-        "title":       best_paper["title"],
-        "pmcid":       best_paper["pmcid"],
-        "pmid":        best_paper["pmid"],
-        "doi":         best_paper["doi"],
-        "text_source": best_paper["text_data"]["source"],
-        "validation":  best_paper["validation"],
+        "title":            best_paper["title"],
+        "pmcid":            best_paper["pmcid"],
+        "pmid":             best_paper["pmid"],
+        "doi":              best_paper["doi"],
+        "text_source":      best_paper["text_data"]["source"],
+        "retrieval_source": best_paper.get("retrieval_source"),
+        "relevance_score":  best_paper.get("relevance_score"),
+        "validation":       best_paper["validation"],
     }
     final["papers_found"] = len(papers)
 

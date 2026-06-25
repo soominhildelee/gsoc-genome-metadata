@@ -58,6 +58,7 @@ def fetch_assembly_metadata(accession: str) -> dict:
         "assembly_name":      assembly_info.get("assembly_name"),
         "taxon_id":           str(organism.get("tax_id", "")),
         "scientific_name":    organism.get("organism_name"),
+        "common_name":        organism.get("common_name"),   # NEW — mentor: search by common name too
         "linked_pmids":       linked_pmids,
         "chromosome_number":  chromosome_number,
         "chromosome_source":  "ncbi" if chromosome_number else None,
@@ -66,14 +67,109 @@ def fetch_assembly_metadata(accession: str) -> dict:
 
 # ============================================================
 # STEP 2 — Find linked papers
-#           Strategy:
+#           Strategy (Mode B — escalate on weak result):
 #           1st: directly linked PMIDs from NCBI assembly record
 #           2nd: NCBI Entrez elink (curated assembly -> pubmed links)
-#                — this is the most reliable source
-#           3rd: Europe PMC text search by scientific name
+#           -- if no STRONG genome-paper candidate from the above, escalate:
+#           3rd: Europe PMC search by scientific_name AND common_name
 #           4th: NCBI Entrez PMC search
 #           5th: Semantic Scholar
+#           Candidates from all sources are POOLED, de-duplicated, and
+#           ranked best-first by score_paper_candidate().
 # ============================================================
+
+ORGANELLE_KEYWORDS = [
+    "chloroplast", "mitochondria", "plastid",
+    "organelle", "cpdna", "mtdna", "plastome",
+]
+GENOME_KEYWORDS = [
+    "genome assembly", "genome sequence", "reference genome",
+    "chromosome-level", "chromosome-scale", "de novo assembly",
+    "whole genome", "whole-genome", "genome of",
+]
+PLOIDY_HINTS = [
+    "diploid", "triploid", "tetraploid", "pentaploid", "hexaploid",
+    "octoploid", "polyploid", "allopolyploid", "autopolyploid",
+    "amphidiploid", "ploidy", "2n=", "2n =",
+]
+
+# A candidate scoring >= STRONG_SCORE is treated as a confident genome paper,
+# so Mode B will NOT escalate to extra name-based searches.
+STRONG_SCORE = 6.0
+
+
+def score_paper_candidate(paper: dict, identifiers: dict) -> float:
+    """Relevance score for "is this the genome/ploidy paper for THIS species?".
+
+    Used both to rank pooled candidates and to decide Mode-B escalation.
+    """
+    title    = (paper.get("title") or "").lower()
+    abstract = (paper.get("abstractText") or "").lower()
+    text     = f"{title} {abstract}"
+
+    sci    = (identifiers.get("scientific_name") or "").lower()
+    common = (identifiers.get("common_name") or "").lower()
+    genus  = sci.split()[0] if sci else ""
+
+    score = 0.0
+
+    # name match (scientific > common > genus)
+    if sci and sci in title:
+        score += 3.0
+    elif sci and sci in text:
+        score += 1.5
+    if common and len(common) >= 4 and common in title:
+        score += 1.5
+    if genus and genus in title:
+        score += 1.0
+
+    # genome-paper signal (word-order tolerant: "assembly of the ... genome")
+    if any(k in title for k in GENOME_KEYWORDS):
+        score += 3.0
+    elif "genome" in title and "assembl" in title:
+        score += 2.5
+    elif "genome" in title or "assembl" in title:
+        score += 1.5
+    elif any(k in text for k in GENOME_KEYWORDS):
+        score += 1.0
+
+    # ploidy signal
+    if any(k in text for k in PLOIDY_HINTS):
+        score += 1.0
+
+    # full text availability
+    if paper.get("pmcid") or paper.get("pmCid"):
+        score += 2.0
+
+    # organelle penalty (a chloroplast/mito paper must never rank as a strong
+    # nuclear-genome candidate, so the title penalty is large)
+    if any(k in title for k in ORGANELLE_KEYWORDS):
+        score -= 10.0
+    elif any(k in abstract for k in ORGANELLE_KEYWORDS):
+        score -= 2.0
+
+    return score
+
+
+def _dedupe_and_rank(candidates: list, identifiers: dict) -> list:
+    """Drop duplicate papers across sources, attach relevance_score, sort desc."""
+    seen = set()
+    out  = []
+    for p in candidates:
+        key = (
+            (p.get("pmid") or "").strip()
+            or (p.get("pmcid") or p.get("pmCid") or "").strip()
+            or (p.get("doi") or "").strip()
+            or (p.get("title", "")[:80].lower())
+        )
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        p["relevance_score"] = round(score_paper_candidate(p, identifiers), 2)
+        out.append(p)
+    out.sort(key=lambda x: x["relevance_score"], reverse=True)
+    return out
+
 
 def search_europe_pmc(query: str, max_results: int = 5, retries: int = 3) -> list:
     url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
@@ -118,16 +214,23 @@ def search_by_pmid(pmid: str) -> dict | None:
 def search_europe_pmc_by_name(
     taxon_id:        str,
     scientific_name: str,
+    common_name:     str = "",
     max_results:     int = 5,
 ) -> list:
     genus = scientific_name.split()[0] if scientific_name else ""
 
+    # Multi-identifier name clause: scientific name, plus common name when
+    # it is specific enough to be useful (>= 4 chars avoids junk like "fly").
+    name_clause = f'"{scientific_name}"'
+    if common_name and len(common_name) >= 4:
+        name_clause = f'("{scientific_name}" OR "{common_name}")'
+
     queries = [
-        # 1st priority: exact species name + genome assembly
-        f'"{scientific_name}" AND "genome assembly"',
-        # 2nd priority: exact species name + chromosome + ploidy
-        f'"{scientific_name}" AND chromosome AND ploidy',
-        # 3rd priority: exact species name + genome sequence
+        # 1st priority: name(s) + genome assembly
+        f'{name_clause} AND "genome assembly"',
+        # 2nd priority: name(s) + genome sequence / ploidy / chromosome
+        f'{name_clause} AND ("genome sequence" OR ploidy OR chromosome)',
+        # 3rd priority: scientific name + genome sequence
         f'"{scientific_name}" AND "genome sequence"',
         # 4th priority: taxon ID fallback (last resort)
         f"TAXONOMY:{taxon_id} AND genome assembly",
@@ -138,6 +241,8 @@ def search_europe_pmc_by_name(
         if not results:
             continue
 
+        # Keep only results that actually mention the genus — guards against
+        # false positives from an ambiguous common name.
         relevant = [
             r for r in results
             if genus.lower() in (
@@ -158,10 +263,6 @@ def search_europe_pmc_by_name(
 def has_usable_fulltext(papers: list[dict]) -> bool:
     # Returns True only if at least one paper has a PMCID
     # and is NOT an organelle genome paper
-    ORGANELLE_KEYWORDS = [
-        "chloroplast", "mitochondria", "plastid",
-        "organelle", "cpdna", "mtdna", "plastome",
-    ]
     for p in papers:
         pmcid = p.get("pmcid") or p.get("pmCid") or ""
         if not pmcid:
@@ -421,55 +522,83 @@ def get_best_available_text(paper: dict) -> dict:
 def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
     print(f"\n[1/4] Fetching assembly metadata for {accession} ...")
     assembly        = fetch_assembly_metadata(accession)
-    scientific_name = assembly.get("scientific_name", "")
-    taxon_id        = assembly.get("taxon_id", "")
+    scientific_name = assembly.get("scientific_name", "") or ""
+    common_name     = assembly.get("common_name", "") or ""
+    taxon_id        = assembly.get("taxon_id", "") or ""
+
+    # Mentor's "key metadata fields" — used as multiple retrieval identifiers
+    identifiers = {
+        "accession":       accession,
+        "assembly_name":   assembly.get("assembly_name"),
+        "scientific_name": scientific_name,
+        "common_name":     common_name,
+        "taxon_id":        taxon_id,
+    }
 
     print(f"      taxon_id          = {taxon_id}")
     print(f"      scientific_name   = {scientific_name}")
+    print(f"      common_name       = {common_name or '(none)'}")
     print(f"      assembly_name     = {assembly.get('assembly_name')}")
     print(f"      chromosome_number = {assembly.get('chromosome_number')} "
           f"(source: {assembly.get('chromosome_source') or 'not found -> will try text extraction'})")
 
-    papers_found = []
+    candidates = []
 
-    # Priority 1: directly linked PMIDs from NCBI assembly record
+    def strongest(cands):
+        return max((score_paper_candidate(p, identifiers) for p in cands), default=0.0)
+
+    # Priority 1: directly linked PMIDs from the NCBI assembly record
     linked_pmids = assembly.get("linked_pmids", [])
     if linked_pmids:
         print(f"\n[2/4] Fetching {len(linked_pmids)} directly linked paper(s) ...")
         for pmid in linked_pmids:
             paper = search_by_pmid(pmid)
             if paper:
-                papers_found.append(paper)
+                paper["retrieval_source"] = "linked_pmid"
+                candidates.append(paper)
                 print(f"      Found: {paper.get('title', '')[:70]}...")
 
-    # Priority 2: NCBI Entrez elink — always try this
-    # elink uses curated assembly -> pubmed links from NCBI,
-    # which is more reliable than free-text search
-    if not papers_found:
+    # Priority 2: NCBI Entrez elink (curated assembly -> pubmed)
+    if not candidates:
         print(f"\n[2/4] Trying NCBI Entrez elink for {accession} ...")
-        elink_papers = fetch_linked_pubmed_for_assembly(accession, max_results=max_results)
-        if elink_papers:
-            papers_found = elink_papers
+        for p in fetch_linked_pubmed_for_assembly(accession, max_results=max_results):
+            p["retrieval_source"] = "elink"
+            candidates.append(p)
 
-    # Priority 3: Europe PMC text search — fallback when elink finds nothing
-    if not papers_found:
-        print(f"\n[2/4] Trying Europe PMC search for {scientific_name} ...")
-        papers_found = search_europe_pmc_by_name(
-            taxon_id, scientific_name, max_results=max_results
-        )
+    # ---- Mode B escalation: if the accession-linked candidates contain no
+    #      STRONG genome paper, search by scientific + common name and merge.
+    if strongest(candidates) < STRONG_SCORE:
+        print(f"\n[2/4] No strong genome paper from accession links "
+              f"(best score {strongest(candidates):.1f}) "
+              f"-> multi-identifier name search ...")
+        for p in search_europe_pmc_by_name(taxon_id, scientific_name, common_name,
+                                            max_results=max_results):
+            p.setdefault("retrieval_source", "europepmc_name")
+            candidates.append(p)
 
-    # Priority 4: NCBI Entrez PMC search
-    if not papers_found:
+    # Priority 4: NCBI Entrez PMC search — still no strong candidate
+    if strongest(candidates) < STRONG_SCORE:
         print(f"\n[2/4] Trying NCBI Entrez PMC search for {scientific_name} ...")
-        papers_found = search_ncbi_entrez(scientific_name, max_results=max_results)
+        for p in search_ncbi_entrez(scientific_name, max_results=max_results):
+            p.setdefault("retrieval_source", "entrez")
+            candidates.append(p)
 
-    # Priority 5: Semantic Scholar — final fallback
-    if not papers_found:
+    # Priority 5: Semantic Scholar — nothing found at all
+    if not candidates:
         print(f"\n[2/4] Trying Semantic Scholar for {scientific_name} ...")
-        papers_found = search_semantic_scholar(scientific_name, max_results=max_results)
+        for p in search_semantic_scholar(scientific_name, max_results=max_results):
+            p.setdefault("retrieval_source", "semantic_scholar")
+            candidates.append(p)
 
-    if not papers_found:
+    if not candidates:
         print(f"\n[2/4] All search sources exhausted. No papers found.")
+
+    # ---- de-duplicate across sources + rank best-first by relevance ----
+    papers_found = _dedupe_and_rank(candidates, identifiers)
+    if papers_found:
+        top = papers_found[0]
+        print(f"\n      {len(papers_found)} unique candidate(s) ranked; "
+              f"top score {top['relevance_score']} ({top.get('retrieval_source')})")
 
     print(f"\n[3/4] Validating IDs and fetching text ...")
     enriched_papers = []
@@ -477,15 +606,18 @@ def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
         validation = validate_paper_ids(paper)
         text_data  = get_best_available_text(paper)
         enriched_papers.append({
-            "title":      paper.get("title", ""),
-            "pmcid":      paper.get("pmcid"),
-            "pmid":       paper.get("pmid"),
-            "doi":        paper.get("doi"),
-            "validation": validation,
-            "text_data":  text_data,
+            "title":            paper.get("title", ""),
+            "pmcid":            paper.get("pmcid"),
+            "pmid":             paper.get("pmid"),
+            "doi":              paper.get("doi"),
+            "retrieval_source": paper.get("retrieval_source"),
+            "relevance_score":  paper.get("relevance_score"),
+            "validation":       validation,
+            "text_data":        text_data,
         })
         print(f"      [{validation['best_available']:>10}]  "
-              f"{paper.get('title', '')[:60]}...")
+              f"(score {paper.get('relevance_score')}, {paper.get('retrieval_source')})  "
+              f"{paper.get('title', '')[:52]}...")
 
     print(f"\n[4/4] Done. {len(enriched_papers)} paper(s) ready for extraction.")
     print(f"      chromosome_number will be "

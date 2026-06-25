@@ -7,7 +7,6 @@ import pandas as pd
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
-# Shared ploidy logic — keeps rule-based and vector stages consistent
 from extract import resolve_ploidy_fields, _LEVEL_LABEL
 
 # ============================================================
@@ -363,9 +362,10 @@ def ensemble_sex(rule_sex: dict, vector_sex: dict) -> dict:
 # ============================================================
 
 QUERIES = {
-    "ploidy":  "ploidy level diploid triploid tetraploid hexaploid polyploid "
-               "allopolyploid autopolyploid amphidiploid whole genome duplication "
-               "chromosome number 2n 4x 6x",
+    "ploidy":  "ploidy level diploid triploid tetraploid hexaploid octoploid "
+               "polyploid allopolyploid autopolyploid amphidiploid "
+               "whole genome duplication WGD karyotype "
+               "chromosome number chromosome count 2n 4x 6x",
     "strain":  "cultivar strain ecotype variety accession",
     "sex":     "female male sex chromosome XY ZW dioecious",
     "species": "scientific name genus species organism",
@@ -418,6 +418,18 @@ def run_vector_search(parsed: dict, rule_result: dict) -> dict:
             "source": "vector_search",
         },
     }
+
+    # Retain the ploidy evidence passages (semantic-retrieval provenance):
+    # the top ploidy-query chunks, each with its section and fused score, so a
+    # curator can see exactly which passages support the ploidy call.
+    final["ploidy"]["evidence_passages"] = [
+        {
+            "text":    r["text"],
+            "section": r["section"],
+            "score":   r["score"],
+        }
+        for r in vector_results["ploidy"][:5]
+    ]
 
     # Print summary
     print("\n" + "=" * 60)

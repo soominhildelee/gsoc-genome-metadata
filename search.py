@@ -7,6 +7,7 @@ import pandas as pd
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
+# Shared ploidy logic — keeps rule-based and vector stages consistent
 from extract import resolve_ploidy_fields, _LEVEL_LABEL
 
 # ============================================================
@@ -279,12 +280,20 @@ def ensemble_ploidy(rule_result: dict, vector_result: dict) -> dict:
     irregular  = rule_result.get("irregular") or vector_result.get("irregular") or False
     derivation = rule_result.get("derivation") or vector_result.get("derivation")
 
-    def out(level, conf, method, evidence):
+    def out(level, conf, method, evidence, origin=None):
         mech = mechanism
         if level == 1:
             mech = None
         elif level is not None and level < 3:
             mech = None
+        # carry the status/source from whichever result supplied the level
+        if origin is not None and (origin.get("status") or origin.get("source")):
+            status = origin.get("status")
+            source = origin.get("source")
+        elif level is not None or mech is not None:
+            status, source = "found_in_paper", "paper"
+        else:
+            status, source = "not_stated_in_paper", None
         return {
             "level":       level,
             "mechanism":   mech,
@@ -292,6 +301,8 @@ def ensemble_ploidy(rule_result: dict, vector_result: dict) -> dict:
             "derivation":  derivation,
             "tuple":       [level, mech, irregular, derivation],
             "level_label": _LEVEL_LABEL.get(level) if level is not None else None,
+            "status":      status,
+            "source":      source,
             "confidence":  conf,
             "method":      method,
             "evidence":    evidence,
@@ -300,21 +311,21 @@ def ensemble_ploidy(rule_result: dict, vector_result: dict) -> dict:
     if r_lvl is None and v_lvl is None:
         if mechanism:
             return out(None, max(r_conf, v_conf, 0.4), "mechanism_only",
-                       rule_result.get("evidence") or vector_result.get("evidence"))
-        return out(None, 0.0, "both_unknown", None)
+                       rule_result.get("evidence") or vector_result.get("evidence"), rule_result)
+        return out(None, 0.0, "both_unknown", None, rule_result)
     elif r_lvl == v_lvl:
         return out(r_lvl, min(round((r_conf + v_conf) / 2 + 0.1, 2), 0.95),
-                   "consensus", rule_result.get("evidence"))
+                   "consensus", rule_result.get("evidence"), rule_result)
     elif r_lvl is None:
-        return out(v_lvl, round(v_conf * 0.9, 2), "vector_only", vector_result.get("evidence"))
+        return out(v_lvl, round(v_conf * 0.9, 2), "vector_only", vector_result.get("evidence"), vector_result)
     elif v_lvl is None:
-        return out(r_lvl, round(r_conf * 0.9, 2), "rule_only", rule_result.get("evidence"))
+        return out(r_lvl, round(r_conf * 0.9, 2), "rule_only", rule_result.get("evidence"), rule_result)
     else:
         # Conflict — penalise confidence, pick higher-confidence level
         if r_conf >= v_conf:
-            return out(r_lvl, round(r_conf * 0.8, 2), "rule_wins (conflict)", rule_result.get("evidence"))
+            return out(r_lvl, round(r_conf * 0.8, 2), "rule_wins (conflict)", rule_result.get("evidence"), rule_result)
         else:
-            return out(v_lvl, round(v_conf * 0.8, 2), "vector_wins (conflict)", vector_result.get("evidence"))
+            return out(v_lvl, round(v_conf * 0.8, 2), "vector_wins (conflict)", vector_result.get("evidence"), vector_result)
 
 
 def ensemble_cultivars(

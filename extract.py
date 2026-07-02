@@ -266,6 +266,11 @@ def resolve_ploidy_fields(segments: list) -> dict:
     elif level is not None and level < 3:
         mechanism = None                 # diploid SHOULD have null mechanism
 
+    if level is not None or mechanism is not None:
+        status, source = "found_in_paper", "paper"
+    else:
+        status, source = "not_stated_in_paper", None
+
     return {
         "level":           level,
         "mechanism":       mechanism,
@@ -273,6 +278,8 @@ def resolve_ploidy_fields(segments: list) -> dict:
         "derivation":      derivation,
         "tuple":           [level, mechanism, irregular, derivation],
         "level_label":     _LEVEL_LABEL.get(level) if level is not None else None,
+        "status":          status,
+        "source":          source,
         "confidence":      confidence,
         "method":          method,
         "evidence":        evidence,
@@ -354,11 +361,12 @@ def extract_chromosome_number(weighted_sections: dict) -> dict:
 # ============================================================
 
 CULTIVAR_PATTERNS = [
-    r"cultivar\s+['\u2018\u2019\"]([^'\u2018\u2019\"]+)['\u2018\u2019\"]",
-    r"cv\.\s*['\u2018\u2019\"]?([A-Z][a-zA-Z\s]+)",
+    r"(?i:cultivar)\s+['\u2018\u2019\"]([^'\u2018\u2019\"]+)['\u2018\u2019\"]",
+    r"(?i:cv)\.\s*['\u2018\u2019\"]?([A-Z][a-zA-Z\s]+)",
     r"['\u2018\u2019]([A-Z][a-zA-Z\s]{2,25})['\u2018\u2019]",
-    r"strain\s+([A-Z][a-zA-Z0-9\-]+)",
-    r"ecotype\s+([A-Z][a-zA-Z0-9\-]+)",
+    r"(?i:cultivar)[:\s]+([A-Z][\w\-]*(?: [A-Z0-9][\w\-]*){0,2})",
+    r"(?i:strain)[:\s]+([A-Z][\w\-]*(?: [A-Z0-9][\w\-]*){0,2})",
+    r"(?i:ecotype)[:\s]+([A-Z][\w\-]*(?: [A-Z0-9][\w\-]*){0,2})",
 ]
 
 CULTIVAR_STOPWORDS = {
@@ -371,12 +379,23 @@ CULTIVAR_STOPWORDS = {
     "haplome", "haplotype", "genbank", "refseq", "bioproject",
 }
 
+def _looks_like_name(s: str) -> bool:
+    if not (2 < len(s) <= 30):
+        return False
+    toks = s.split()
+    if not (1 <= len(toks) <= 3):
+        return False
+    return all(t[0].isupper() or t[0].isdigit() for t in toks)
+
+
 def extract_cultivars(filtered_text: str) -> list:
     cultivars = set()
     for pattern in CULTIVAR_PATTERNS:
-        for match in re.findall(pattern, filtered_text, re.IGNORECASE):
-            name = match.strip()
-            if 2 < len(name) <= 30 and name.lower() not in CULTIVAR_STOPWORDS:
+        for match in re.findall(pattern, filtered_text):
+            name = match.strip().rstrip(".").strip()
+            if name.lower() in CULTIVAR_STOPWORDS:
+                continue
+            if _looks_like_name(name):
                 cultivars.add(name)
     return sorted(cultivars)
 
@@ -491,25 +510,36 @@ def extract_metadata(parsed: dict, assembly: dict, paper_title: str = None) -> d
     cultivars = extract_cultivars(filtered_text)
     sex       = extract_sex(weighted_sections)
 
-    # ── Ploidy reference fallback (text + NCBI both silent) ───
-    #     Delete this block to return level=None when the text is silent.
-    if ploidy["level"] is None and str(ncbi_taxon) in KNOWN_PLOIDY:
-        ref_level = KNOWN_PLOIDY[str(ncbi_taxon)]
-        print(f"  [extract] ploidy level not in text → reference fallback: "
-              f"{ref_level} (taxon {ncbi_taxon})")
-        ploidy = {
-            "level":           ref_level,
-            "mechanism":       None,
-            "irregular":       False,
-            "derivation":      None,
-            "tuple":           [ref_level, None, False, None],
-            "level_label":     _LEVEL_LABEL.get(ref_level),
-            "confidence":      0.6,
-            "method":          "reference_taxon",
-            "evidence":        f"(reference DB: taxon {ncbi_taxon} documented as level {ref_level})",
-            "evidence_count":  0,
-            "weighted_counts": {},
-        }
+    # ── Ploidy reference fallback (paper is silent on ploidy) ────────────
+    #     Mentor: a reference value is acceptable IF it is clearly sourced and
+    #     kept separate from paper-derived values. Prefer GoaT (taxon-based,
+    #     attached by fetch.enrich_*), fall back to the small built-in table.
+    if ploidy["level"] is None:
+        ref_level  = assembly.get("reference_ploidy")
+        ref_source = "GoaT" if ref_level is not None else None
+        if ref_level is None and str(ncbi_taxon) in KNOWN_PLOIDY:
+            ref_level, ref_source = KNOWN_PLOIDY[str(ncbi_taxon)], "reference_db"
+        if ref_level is not None:
+            print(f"  [extract] ploidy not stated in paper → reference: "
+                  f"{ref_level} (taxon {ncbi_taxon}, source {ref_source})")
+            ploidy = {
+                "level":           ref_level,
+                "mechanism":       None,
+                "irregular":       False,
+                "derivation":      None,
+                "tuple":           [ref_level, None, False, None],
+                "level_label":     _LEVEL_LABEL.get(ref_level),
+                "status":          "from_reference",
+                "source":          ref_source,
+                "confidence":      0.6,
+                "method":          "reference_taxon",
+                "evidence":        f"(reference {ref_source}: taxon {ncbi_taxon} documented as level {ref_level})",
+                "evidence_count":  0,
+                "weighted_counts": {},
+            }
+        else:
+            print(f"  [extract] ploidy not stated in paper and no reference available "
+                  f"→ status: not_stated_in_paper")
 
     print(f"  [extract] Done.")
     print(f"            species           = {species['value']} (source: {species['source']})")

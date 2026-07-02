@@ -66,6 +66,109 @@ def fetch_assembly_metadata(accession: str) -> dict:
 
 
 # ============================================================
+# Taxonomy enrichment (use taxon_id to fill gaps)
+#   - common_name from NCBI Taxonomy efetch (fixes species like maize where
+#     NCBI datasets returns no common_name -> name search degrades)
+#   - reference ploidy / chromosome number from GoaT (taxon-based, sourced)
+# ============================================================
+
+import re as _re
+from xml.etree import ElementTree as _ET
+
+
+def fetch_taxonomy_common_name(taxon_id: str) -> str | None:
+    if not taxon_id:
+        return None
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    try:
+        r = requests.get(url, params={"db": "taxonomy", "id": str(taxon_id)}, timeout=30)
+        r.raise_for_status()
+        root = _ET.fromstring(r.text)
+        taxon = root.find("Taxon")
+        if taxon is None:
+            return None
+        # GenbankCommonName preferred, else the first CommonName
+        gcn = taxon.find(".//OtherNames/GenbankCommonName")
+        if gcn is not None and gcn.text:
+            return gcn.text.strip()
+        cn = taxon.find(".//OtherNames/CommonName")
+        if cn is not None and cn.text:
+            return cn.text.strip()
+    except (requests.RequestException, _ET.ParseError):
+        pass
+    return None
+
+
+def fetch_goat_reference(taxon_id: str) -> dict:
+    """Look up taxon-level reference ploidy / chromosome number from GoaT.
+
+    GoaT stores attributes under records[0].record.attributes. Each attribute
+    carries an `aggregation_source`: "direct" = a directly measured/curated
+    value; "ancestor"/"descendant" = phylogenetically *inferred*. We only trust
+    DIRECT values — inferred ones repeat the polyploid-ancestor trap (e.g. for
+    Arabidopsis, GoaT's ploidy_inferred is 4 via the tribe, which is wrong).
+    Any unexpected shape -> returns Nones so the pipeline falls back safely.
+    """
+    out = {"reference_ploidy": None, "reference_chromosome": None}
+    if not taxon_id:
+        return out
+    url = "https://goat.genomehubs.org/api/v2/record"
+    try:
+        r = requests.get(url, params={
+            "recordId": str(taxon_id), "result": "taxon", "taxonomy": "ncbi",
+        }, timeout=30)
+        r.raise_for_status()
+        recs = r.json().get("records", [])
+        if not recs:
+            return out
+        attrs = (recs[0].get("record", {}) or {}).get("attributes", {}) or {}
+
+        def _direct_int(*keys):
+            # try each attribute key in order; accept only directly-measured values
+            for key in keys:
+                a = attrs.get(key)
+                if not isinstance(a, dict):
+                    continue
+                if a.get("aggregation_source") != "direct":
+                    continue   # skip inferred (ancestor/descendant) values
+                for vk in ("value", "median", "mode", "max", "min"):
+                    v = a.get(vk)
+                    if v is None:
+                        continue
+                    m = _re.search(r"\d+", str(v))
+                    if m:
+                        return int(m.group())
+            return None
+
+        out["reference_ploidy"]     = _direct_int("ploidy", "ploidy_inferred")
+        out["reference_chromosome"] = _direct_int("chromosome_number", "haploid_chromosome_count")
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        pass
+    return out
+
+
+def enrich_assembly_metadata(assembly: dict) -> dict:
+    """Fill common_name (if missing) and attach GoaT reference values, using taxon_id."""
+    taxon_id = assembly.get("taxon_id")
+    if not taxon_id:
+        return assembly
+
+    if not assembly.get("common_name"):
+        cn = fetch_taxonomy_common_name(taxon_id)
+        if cn:
+            assembly["common_name"] = cn
+            assembly["common_name_source"] = "ncbi_taxonomy"
+            print(f"      common_name filled from NCBI Taxonomy: {cn}")
+
+    goat = fetch_goat_reference(taxon_id)
+    assembly["reference_ploidy"]     = goat.get("reference_ploidy")
+    assembly["reference_chromosome"] = goat.get("reference_chromosome")
+    if goat.get("reference_ploidy") is not None:
+        print(f"      GoaT reference ploidy (taxon {taxon_id}): {goat['reference_ploidy']}")
+    return assembly
+
+
+# ============================================================
 # STEP 2 — Find linked papers
 #           Strategy (Mode B — escalate on weak result):
 #           1st: directly linked PMIDs from NCBI assembly record
@@ -95,7 +198,7 @@ PLOIDY_HINTS = [
 
 # A candidate scoring >= STRONG_SCORE is treated as a confident genome paper,
 # so Mode B will NOT escalate to extra name-based searches.
-STRONG_SCORE = 6.0
+STRONG_SCORE = 5.0
 
 
 def score_paper_candidate(paper: dict, identifiers: dict) -> float:
@@ -140,6 +243,10 @@ def score_paper_candidate(paper: dict, identifiers: dict) -> float:
     # full text availability
     if paper.get("pmcid") or paper.get("pmCid"):
         score += 2.0
+
+    # BioProject-linked reference paper: canonical publication for the assembly
+    if paper.get("is_reference_paper"):
+        score += 2.5
 
     # organelle penalty (a chloroplast/mito paper must never rank as a strong
     # nuclear-genome candidate, so the title penalty is large)
@@ -334,7 +441,66 @@ def fetch_linked_pubmed_for_assembly(accession: str, max_results: int = 5) -> li
     return papers
 
 
-def search_ncbi_entrez(scientific_name: str, max_results: int = 5) -> list:
+def fetch_bioproject_reference_papers(accession: str, max_results: int = 5) -> list:
+    """Mentor item 3: follow assembly -> BioProject -> PubMed to retrieve the
+    canonical *reference* paper for the assembly. These are attached even when
+    they carry no ploidy information (a BioProject paper still anchors species /
+    common name / provenance). Pure-Entrez chain; defensive on every step."""
+    eutils = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+    def _elink(dbfrom, db, uid):
+        try:
+            r = requests.get(f"{eutils}/elink.fcgi", params={
+                "dbfrom": dbfrom, "db": db, "id": uid, "retmode": "json",
+            }, timeout=30)
+            r.raise_for_status()
+            ls = r.json().get("linksets", [{}])[0]
+            for ldb in ls.get("linksetdbs", []):
+                if ldb.get("dbto") == db:
+                    return ldb.get("links", [])
+        except (requests.RequestException, ValueError, KeyError, IndexError):
+            pass
+        return []
+
+    # Step 1: accession -> assembly UID
+    try:
+        r = requests.get(f"{eutils}/esearch.fcgi", params={
+            "db": "assembly", "term": accession, "retmode": "json"}, timeout=30)
+        r.raise_for_status()
+        asm_ids = r.json().get("esearchresult", {}).get("idlist", [])
+    except (requests.RequestException, ValueError):
+        asm_ids = []
+    if not asm_ids:
+        return []
+
+    # Step 2: assembly UID -> BioProject UID(s)
+    bioproject_ids = _elink("assembly", "bioproject", asm_ids[0])
+    if not bioproject_ids:
+        print("  [BioProject] No linked BioProject found")
+        return []
+    print(f"  [BioProject] Linked BioProject UID(s): {bioproject_ids[:5]}")
+
+    # Step 3: BioProject UID(s) -> reference PMIDs
+    pmids = []
+    for bp in bioproject_ids[:3]:
+        for pmid in _elink("bioproject", "pubmed", bp):
+            if pmid not in pmids:
+                pmids.append(pmid)
+    if not pmids:
+        print("  [BioProject] No reference publication linked to BioProject")
+        return []
+    print(f"  [BioProject] Found {len(pmids)} reference PMID(s): {pmids[:5]}")
+
+    # Step 4: fetch paper details, tag as reference paper
+    papers = []
+    for pmid in pmids[:max_results]:
+        paper = search_by_pmid(str(pmid))
+        if paper:
+            paper["retrieval_source"]  = "bioproject"
+            paper["is_reference_paper"] = True
+            papers.append(paper)
+            print(f"  [BioProject] {pmid}: {paper.get('title', '')[:60]}...")
+    return papers
     print(f"  [NCBI Entrez] Searching PubMed Central for {scientific_name} ...")
 
     # Step 1: search for PMC IDs
@@ -522,6 +688,7 @@ def get_best_available_text(paper: dict) -> dict:
 def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
     print(f"\n[1/4] Fetching assembly metadata for {accession} ...")
     assembly        = fetch_assembly_metadata(accession)
+    assembly        = enrich_assembly_metadata(assembly)   # common_name + GoaT reference via taxon_id
     scientific_name = assembly.get("scientific_name", "") or ""
     common_name     = assembly.get("common_name", "") or ""
     taxon_id        = assembly.get("taxon_id", "") or ""
@@ -541,6 +708,12 @@ def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
     print(f"      assembly_name     = {assembly.get('assembly_name')}")
     print(f"      chromosome_number = {assembly.get('chromosome_number')} "
           f"(source: {assembly.get('chromosome_source') or 'not found -> will try text extraction'})")
+
+    # Guard: no scientific name / taxon -> name-based search would degenerate
+    # into an empty query and return unrelated papers. Skip retrieval entirely.
+    if not scientific_name and not taxon_id:
+        print("      No NCBI scientific_name / taxon_id — skipping paper retrieval.")
+        return {"assembly": assembly, "papers": []}
 
     candidates = []
 
@@ -564,6 +737,14 @@ def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
         for p in fetch_linked_pubmed_for_assembly(accession, max_results=max_results):
             p["retrieval_source"] = "elink"
             candidates.append(p)
+
+    # Priority 2b: BioProject reference paper (assembly -> bioproject -> pubmed).
+    # Always pooled — the canonical reference paper should be attachable even
+    # when it carries no ploidy information (mentor item 3).
+    print(f"\n[2/4] Looking up BioProject reference paper for {accession} ...")
+    bioproject_papers = fetch_bioproject_reference_papers(accession, max_results=max_results)
+    for p in bioproject_papers:
+        candidates.append(p)
 
     # ---- Mode B escalation: if the accession-linked candidates contain no
     #      STRONG genome paper, search by scientific + common name and merge.
@@ -612,6 +793,7 @@ def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
             "doi":              paper.get("doi"),
             "retrieval_source": paper.get("retrieval_source"),
             "relevance_score":  paper.get("relevance_score"),
+            "is_reference_paper": bool(paper.get("is_reference_paper")),
             "validation":       validation,
             "text_data":        text_data,
         })
@@ -619,11 +801,27 @@ def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
               f"(score {paper.get('relevance_score')}, {paper.get('retrieval_source')})  "
               f"{paper.get('title', '')[:52]}...")
 
+    # Canonical reference paper (best BioProject-linked candidate), attached
+    # regardless of whether it ends up carrying ploidy (mentor item 3).
+    reference_paper = None
+    for paper in papers_found:
+        if paper.get("is_reference_paper"):
+            reference_paper = {
+                "title":            paper.get("title", ""),
+                "pmcid":            paper.get("pmcid"),
+                "pmid":             paper.get("pmid"),
+                "doi":              paper.get("doi"),
+                "retrieval_source": "bioproject",
+                "relevance_score":  paper.get("relevance_score"),
+            }
+            break
+
     print(f"\n[4/4] Done. {len(enriched_papers)} paper(s) ready for extraction.")
     print(f"      chromosome_number will be "
           f"{'used from NCBI' if assembly.get('chromosome_number') else 'extracted from text in extract.py'}")
 
     return {
-        "assembly": assembly,
-        "papers":   enriched_papers,
+        "assembly":        assembly,
+        "papers":          enriched_papers,
+        "reference_paper": reference_paper,
     }

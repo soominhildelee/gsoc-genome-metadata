@@ -5,6 +5,8 @@ from fetch import fetch_papers_for_assembly
 from parse import parse_paper
 from extract import extract_metadata
 from search import run_vector_search
+import gemma
+from gemma import combine_with_gemma
 
 # ============================================================
 # Paper quality filter
@@ -71,9 +73,22 @@ def run_pipeline(accession: str, max_results: int = 5) -> dict:
     fetched  = fetch_papers_for_assembly(accession, max_results=max_results)
     assembly = fetched["assembly"]
     papers   = fetched["papers"]
+    reference_paper = fetched.get("reference_paper")
+
+    # Guard: NCBI returned no usable assembly metadata (stale / suppressed
+    # accession). Without a scientific name we cannot search by name or trust
+    # text-based species extraction, so stop here with a clear failure mode
+    # instead of degenerating into an empty-query search and garbage output.
+    if not assembly.get("scientific_name") and not assembly.get("taxon_id"):
+        print("  No NCBI assembly metadata (scientific_name / taxon_id missing). "
+              "Likely a stale or suppressed accession — stopping.")
+        return {
+            "assembly_accession": assembly.get("assembly_accession"),
+            "error":              "no_assembly_metadata",
+        }
 
     if not papers:
-        print("  No papers found. Returning assembly metadata only.")
+        print("  No relevant paper found. Returning assembly metadata only.")
         return {
             "assembly_accession": assembly.get("assembly_accession"),
             "assembly_name":      assembly.get("assembly_name"),
@@ -83,9 +98,10 @@ def run_pipeline(accession: str, max_results: int = 5) -> dict:
                 "value":  assembly.get("chromosome_number"),
                 "source": assembly.get("chromosome_source"),
             },
-            "ploidy":    {"value": "unknown", "confidence": 0.0},
+            "ploidy":    {"level": None, "status": "no_relevant_paper", "source": None},
             "cultivars": {"confirmed": [], "unconfirmed": []},
             "sex":       {"value": "unknown"},
+            "paper":     {"note": "Not found relevant paper"},
             "papers_found": 0,
         }
 
@@ -98,6 +114,7 @@ def run_pipeline(accession: str, max_results: int = 5) -> dict:
         return {
             "assembly_accession": assembly.get("assembly_accession"),
             "error":              "no_usable_paper",
+            "paper":              {"note": "Not found relevant paper"},
         }
 
     print(f"  Text source: {best_paper['text_data']['source']}")
@@ -128,6 +145,19 @@ def run_pipeline(accession: str, max_results: int = 5) -> dict:
     print("\n[Step 4/4] Running vector search and ensemble ...")
     final = run_vector_search(parsed, rule_result)
 
+    # ── Step 4.5 (optional): Gemma hybrid layer ───────────────
+    #     Local Gemma extracts a grounded ploidy candidate; combine_with_gemma
+    #     folds it in as a third vote. No-op unless GEMMA_ENABLED=1.
+    if gemma.is_enabled():
+        g = gemma.run_gemma_ploidy(
+            final["species"]["value"],
+            final["ploidy"].get("evidence_passages", []),
+        )
+        if g is not None:
+            final["ploidy"] = combine_with_gemma(final["ploidy"], g)
+            print(f"  [gemma] combined -> level={final['ploidy']['level']} "
+                  f"(method: {final['ploidy']['method']})")
+
     # Add paper-level metadata to final output
     final["paper"] = {
         "title":            best_paper["title"],
@@ -140,6 +170,7 @@ def run_pipeline(accession: str, max_results: int = 5) -> dict:
         "validation":       best_paper["validation"],
     }
     final["papers_found"] = len(papers)
+    final["reference_paper"] = reference_paper   # BioProject canonical paper (attached even if no ploidy)
 
     return final
 

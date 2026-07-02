@@ -19,5 +19,6 @@ venv/
 
 *.ipynb
 *.png
+models/
 iML1515_ectoine.xml
 cbe567*

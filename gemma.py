@@ -16,12 +16,32 @@ VALID_MECHANISMS = {"autopolyploid", "allopolyploid",
 # ---- config ----
 _DEFAULT_MODEL = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "models", "gemma-2-2b-it-Q4_K_M.gguf"
+    "models", "google_gemma-3-4b-it-Q4_K_M.gguf"
 )
 BASE_URL  = os.environ.get("GEMMA_BASE_URL", "http://localhost:8000/v1")
 MODEL     = os.environ.get("GEMMA_MODEL", _DEFAULT_MODEL)
 TIMEOUT   = int(os.environ.get("GEMMA_TIMEOUT", "300"))
 MAX_CHARS = 6000   # cap passage text sent to the model
+N_THREADS = int(os.environ.get("GEMMA_N_THREADS", "32"))  # one NUMA node
+
+# ---- GGUF backend (llama-cpp-python, quantized, fastest CPU option) ----
+_gguf_model = None
+
+# ---- HuggingFace direct backend (float32 fallback, ~16GB RAM) ----
+_HF_MODEL_DIR = os.environ.get(
+    "GEMMA_HF_MODEL_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gemma-3-4b-it"),
+)
+_direct_model     = None
+_direct_tokenizer = None
+
+
+def _gguf_available() -> bool:
+    return MODEL.endswith(".gguf") and os.path.isfile(MODEL)
+
+
+def _weights_available() -> bool:
+    return os.path.isfile(os.path.join(_HF_MODEL_DIR, "config.json"))
 
 
 def _server_is_up() -> bool:
@@ -38,29 +58,294 @@ def is_enabled() -> bool:
         return True
     if env == "0":
         return False
-    # Auto-detect: enabled if the local server is reachable
-    return _server_is_up()
+    # Auto-detect: enabled if GGUF file, HF weights, or HTTP server available
+    return _gguf_available() or _weights_available() or _server_is_up()
+
+
+def _load_gguf_backend():
+    global _gguf_model
+    if _gguf_model is not None:
+        return
+    from llama_cpp import Llama
+    print(f"  [gemma-gguf] loading {os.path.basename(MODEL)} (first call, may take ~10s) ...")
+    _gguf_model = Llama(
+        model_path=MODEL,
+        n_ctx=4096,
+        n_threads=N_THREADS,
+        chat_format="gemma",
+        verbose=False,
+    )
+    print("  [gemma-gguf] model ready")
+
+
+def _call_gguf(species: str, passages: list) -> dict | None:
+    try:
+        _load_gguf_backend()
+    except Exception as e:
+        print(f"  [gemma-gguf] load failed ({e}); will try next backend")
+        return None
+    messages = _build_messages(species, passages)
+    try:
+        resp = _gguf_model.create_chat_completion(
+            messages=messages,
+            temperature=0,
+            max_tokens=600,
+            response_format={"type": "json_object"},
+        )
+        content = resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"  [gemma-gguf] inference failed ({e})")
+        return None
+    return _parse_json(content)
+
+
+def _load_direct_backend():
+    global _direct_model, _direct_tokenizer
+    if _direct_model is not None:
+        return
+
+    model_name = os.path.basename(_HF_MODEL_DIR)
+    print(f"  [gemma-direct] loading {model_name} (first call, may take a minute) ...")
+
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+    _direct_model = AutoModelForCausalLM.from_pretrained(
+        _HF_MODEL_DIR, torch_dtype=torch.float32
+    ).eval()
+    _direct_tokenizer = AutoTokenizer.from_pretrained(_HF_MODEL_DIR)
+    print("  [gemma-direct] model ready")
+
+
+def _call_direct(species: str, passages: list) -> dict | None:
+    try:
+        _load_direct_backend()
+    except Exception as e:
+        print(f"  [gemma-direct] load failed ({e}); will try HTTP server")
+        return None
+
+    import torch
+
+    messages = _build_messages(species, passages)
+    encoded = _direct_tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, return_tensors="pt", tokenize=True,
+    )
+    if hasattr(encoded, "input_ids"):
+        input_ids      = encoded.input_ids
+        attention_mask = encoded.attention_mask
+    else:
+        input_ids      = encoded
+        attention_mask = torch.ones_like(input_ids)
+
+    eos_ids = [_direct_tokenizer.eos_token_id]
+    eot = _direct_tokenizer.convert_tokens_to_ids("<end_of_turn>")
+    if isinstance(eot, int):
+        eos_ids.append(eot)
+
+    try:
+        with torch.no_grad():
+            output = _direct_model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=600,
+                do_sample=False,
+                pad_token_id=_direct_tokenizer.eos_token_id,
+                eos_token_id=eos_ids,
+            )
+    except Exception as e:
+        print(f"  [gemma-direct] generate failed ({e})")
+        return None
+
+    new_ids = output[0][input_ids.shape[1]:]
+    text = _direct_tokenizer.decode(new_ids, skip_special_tokens=True)
+    return _parse_json(text)
 
 
 # JSON schema used for vLLM guided decoding (forces well-formed output).
 _PLOIDY_SCHEMA = {
     "type": "object",
     "properties": {
-        "ploidy_level":      {"type": ["integer", "null"]},
-        "mechanism":         {"type": ["string", "null"]},
-        "evidence_quote":    {"type": ["string", "null"]},
-        "stated_explicitly": {"type": "boolean"},
+        "reasoning":          {"type": "string"},
+        "target_organism":    {"type": ["string", "null"]},
+        "ploidy_level":       {"type": ["integer", "null"]},
+        "ploidy_category":    {"type": ["string", "null"]},
+        "mechanism":          {"type": ["string", "null"]},
+        "chromosome_formula": {"type": ["string", "null"]},
+        "evidence_quote":     {"type": ["string", "null"]},
+        "evidence_type":      {"type": "string"},
+        "stated_explicitly":  {"type": "boolean"},
+        "confidence":         {"type": "string"},
+        "ambiguity_note":     {"type": ["string", "null"]},
     },
-    "required": ["ploidy_level", "mechanism", "evidence_quote", "stated_explicitly"],
+    "required": [
+        "reasoning", "ploidy_level", "ploidy_category", "mechanism",
+        "evidence_quote", "evidence_type", "stated_explicitly",
+        "confidence",
+    ],
 }
 
-_SYSTEM = (
-    "You are a careful genomics curator. You extract ploidy ONLY from the text "
-    "passages provided. You never use outside knowledge. If the passages do not "
-    "EXPLICITLY state the organism's ploidy, you return null. For every value you "
-    "return, you must copy the exact sentence you used as evidence into "
-    "'evidence_quote' (verbatim, from the passages). Output JSON only."
-)
+_SYSTEM = """\
+You are a senior plant genomics scientist and database curator with deep \
+expertise in polyploidy, chromosome biology, and plant genome evolution. You are \
+building a high-quality genome-assembly database by reading passages from a \
+scientific paper and determining the ploidy of a specified TARGET organism.
+
+WHAT COUNTS AS PLOIDY EVIDENCE (you reason like an expert)
+- Chromosome formulas encode it directly: the coefficient of x is the ploidy. \
+"2n = 2x = 14" -> diploid (2); "2n = 4x = 28" -> tetraploid (4); \
+"2n = 6x = 42" -> hexaploid (6).
+- Polyploidy terminology carries a level even without a bare number: \
+"allohexaploid", "amphidiploid", "autotetraploid", "polyploid with three subgenomes".
+- Subgenome counts reveal it: bread wheat with A, B and D subgenomes (from three \
+diploid progenitors) is hexaploid; cotton with A and D subgenomes is allotetraploid.
+- Duplication / hybridization history: "arose from hybridization of two diploid \
+species" implies tetraploid; a "whole-genome duplication" doubles the base level.
+- Genome-size comparisons are indicative but weaker: "genome ~3x that of its \
+diploid relative" suggests raised ploidy — treat as LOW confidence unless \
+corroborated.
+
+PLOIDY LEVEL = NUMBER OF CHROMOSOME SETS
+haploid 1, diploid 2, triploid 3, tetraploid 4, pentaploid 5, hexaploid 6, \
+octoploid 8. Report the integer in `ploidy_level` and the word in `ploidy_category`.
+
+WHICH ORGANISM (critical)
+Determine the ploidy of the TARGET organism only (given in the user message). \
+Do NOT report the ploidy of its progenitors, ancestors, or sister species. \
+A single paper often names organisms at different ploidies — pick the target. \
+If no target is specified, treat the organism whose genome/assembly the paper \
+presents as the target.
+
+GROUNDING (critical)
+Base your answer ONLY on evidence in the passages. Do NOT answer from memorized \
+species->ploidy facts. Passage-grounded inference (reading a formula, counting \
+subgenomes, using stated progenitor counts) is expected and encouraged; memorized \
+facts are not. If the passages contain no ploidy-relevant evidence, return \
+ploidy_level = null, even if you believe you know the species' ploidy.
+
+OUTPUT — a single JSON object and nothing else
+Fill every field. Use JSON null (not the string "null") for unknowns. Put all \
+reasoning inside the `reasoning` field so there is no text outside the JSON.
+
+{
+  "reasoning": "<brief, concrete: what ploidy-relevant evidence is present, which organism it refers to, whether that is the target, and how you derived the level>",
+  "target_organism": "<organism name as it appears in the passages, or null>",
+  "ploidy_level": <integer number of chromosome sets, or null>,
+  "ploidy_category": "<one of: haploid, diploid, triploid, tetraploid, pentaploid, hexaploid, heptaploid, octoploid, polyploid, aneuploid; or null>",
+  "mechanism": "<one of: autopolyploid, allopolyploid, amphidiploid, segmental_allopolyploid; or null>",
+  "chromosome_formula": "<verbatim formula if present, e.g. '2n = 6x = 42'; else null>",
+  "evidence_quote": "<the single most decisive sentence, copied verbatim from the passages; or null>",
+  "evidence_type": "<one of: explicit_statement, chromosome_formula, subgenome_count, progenitor_inference, genome_size_comparison, terminology, none>",
+  "stated_explicitly": <true only if the text directly names the ploidy (e.g. "hexaploid", "6x"); false if inferred; false when ploidy_level is null>,
+  "confidence": "<high, medium, or low>",
+  "ambiguity_note": "<note any conflicting ploidy signals or uncertainty about target vs. relative; else null>"
+}
+
+FLAG GUIDANCE
+- stated_explicitly: true for direct naming ("hexaploid", "6x"); false for expert \
+inference (formula math, subgenome/progenitor counting, size comparison).
+- confidence: high = explicit statement or unambiguous chromosome formula for the \
+target; medium = solid inference (subgenome or progenitor counts, clear terminology); \
+low = indirect signals (genome-size ratios), partial evidence, or ploidy_level = null.
+- mechanism: use null for diploids or when hybridization mode is unclear."""
+
+
+_FEWSHOT = [
+    {
+        "target": "Triticum aestivum",
+        "passage": (
+            "Bread wheat (Triticum aestivum) is an allohexaploid (2n = 6x = 42) "
+            "that arose from hybridization among three diploid progenitors "
+            "carrying the A, B and D genomes. Here we present a chromosome-scale "
+            "assembly of T. aestivum cv. Chinese Spring."
+        ),
+        "output": {
+            "reasoning": (
+                "The passage states T. aestivum is an allohexaploid and gives "
+                "2n = 6x = 42 (x-coefficient 6 -> hexaploid). The A/B/D progenitors "
+                "are diploid relatives, not the target. The assembly is of T. aestivum."
+            ),
+            "target_organism": "Triticum aestivum",
+            "ploidy_level": 6,
+            "ploidy_category": "hexaploid",
+            "mechanism": "allopolyploid",
+            "chromosome_formula": "2n = 6x = 42",
+            "evidence_quote": (
+                "Bread wheat (Triticum aestivum) is an allohexaploid (2n = 6x = 42) "
+                "that arose from hybridization among three diploid progenitors "
+                "carrying the A, B and D genomes."
+            ),
+            "evidence_type": "explicit_statement",
+            "stated_explicitly": True,
+            "confidence": "high",
+            "ambiguity_note": "Passage also mentions diploid (2x) progenitors; these are relatives, not the target.",
+        },
+    },
+    {
+        "target": "Gossypium hirsutum",
+        "passage": (
+            "Upland cotton (Gossypium hirsutum) contains two distinct subgenomes, "
+            "denoted A and D, derived from the merger of two diploid ancestors "
+            "approximately 1-2 million years ago. We sequenced G. hirsutum acc. TM-1."
+        ),
+        "output": {
+            "reasoning": (
+                "G. hirsutum has two subgenomes (A and D) from two diploid ancestors. "
+                "Two merged diploid genomes give a tetraploid. No explicit ploidy word "
+                "or formula is given, so this is inference."
+            ),
+            "target_organism": "Gossypium hirsutum",
+            "ploidy_level": 4,
+            "ploidy_category": "tetraploid",
+            "mechanism": "allopolyploid",
+            "chromosome_formula": None,
+            "evidence_quote": (
+                "Upland cotton (Gossypium hirsutum) contains two distinct subgenomes, "
+                "denoted A and D, derived from the merger of two diploid ancestors "
+                "approximately 1-2 million years ago."
+            ),
+            "evidence_type": "subgenome_count",
+            "stated_explicitly": False,
+            "confidence": "medium",
+            "ambiguity_note": None,
+        },
+    },
+    {
+        "target": "Brassica cretica",
+        "passage": (
+            "We assembled the genome of Brassica cretica. The 250 Mb assembly was "
+            "generated from PacBio HiFi reads and annotated with 28,000 "
+            "protein-coding genes. Synteny with related crucifers was analyzed to "
+            "study diversification."
+        ),
+        "output": {
+            "reasoning": (
+                "The passage reports assembly size, sequencing technology, gene count, "
+                "and synteny but contains no ploidy-relevant evidence: no ploidy term, "
+                "no chromosome formula, no subgenome or progenitor information. "
+                "I must not assume a ploidy from prior knowledge."
+            ),
+            "target_organism": "Brassica cretica",
+            "ploidy_level": None,
+            "ploidy_category": None,
+            "mechanism": None,
+            "chromosome_formula": None,
+            "evidence_quote": None,
+            "evidence_type": "none",
+            "stated_explicitly": False,
+            "confidence": "low",
+            "ambiguity_note": None,
+        },
+    },
+]
+
+
+def _user_block(target: str, passages_str: str) -> str:
+    t = (target or "").strip() or "(not specified — use the organism whose genome this paper presents)"
+    return (
+        f"Target organism: {t}\n\n"
+        f"Passages:\n<passages>\n{passages_str.strip()}\n</passages>\n\n"
+        "Return the single JSON object."
+    )
 
 
 def _build_user_prompt(species: str, passages: list) -> str:
@@ -77,33 +362,16 @@ def _build_user_prompt(species: str, passages: list) -> str:
         if total >= MAX_CHARS:
             break
     joined = "\n\n".join(blocks) if blocks else "(no passages)"
-    return (
-        f"Organism: {species or 'unknown'}\n\n"
-        f"Passages:\n{joined}\n\n"
-        "Task: Determine the ploidy LEVEL of THIS organism (an integer x-level: "
-        "diploid=2, tetraploid=4, hexaploid=6, ...). Do NOT report the ploidy of "
-        "ancestor / progenitor / related species. If a polyploidy mechanism is "
-        "stated, set 'mechanism' to one of: autopolyploid, allopolyploid, "
-        "amphidiploid, segmental_allopolyploid; otherwise null.\n"
-        "Rules:\n"
-        "- If ploidy is not explicitly stated for this organism, set ploidy_level "
-        "to null and stated_explicitly to false.\n"
-        "- 'evidence_quote' must be copied verbatim from a passage above.\n"
-        "Return JSON with keys: ploidy_level, mechanism, evidence_quote, "
-        "stated_explicitly."
-    )
+    return _user_block(species, joined)
 
 
 def _build_messages(species: str, passages: list) -> list:
-    user_content = _build_user_prompt(species, passages)
-    # Gemma-2 chat template raises an exception for system role, so we merge
-    # the system instruction into the first user turn for Gemma-based models.
-    if "gemma" in MODEL.lower():
-        return [{"role": "user", "content": f"{_SYSTEM}\n\n{user_content}"}]
-    return [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user",   "content": user_content},
-    ]
+    msgs = [{"role": "system", "content": _SYSTEM}]
+    for ex in _FEWSHOT:
+        msgs.append({"role": "user",      "content": _user_block(ex["target"], ex["passage"])})
+        msgs.append({"role": "assistant", "content": json.dumps(ex["output"], ensure_ascii=False)})
+    msgs.append({"role": "user", "content": _build_user_prompt(species, passages)})
+    return msgs
 
 
 def _call_vllm(species: str, passages: list) -> dict | None:
@@ -111,7 +379,7 @@ def _call_vllm(species: str, passages: list) -> dict | None:
         "model": MODEL,
         "messages": _build_messages(species, passages),
         "temperature": 0,
-        "max_tokens": 400,
+        "max_tokens": 600,
         # vLLM extension: constrain output to the schema (ignored by plain OpenAI).
         "guided_json": _PLOIDY_SCHEMA,
         # llama-cpp-python / standard OpenAI fallback for JSON mode.
@@ -148,37 +416,96 @@ def _norm(s: str) -> str:
 
 def _is_grounded(quote: str, passages: list) -> bool:
     q = _norm(quote)
-    if len(q) < 12:          # too short to be a meaningful, checkable quote
+    if len(q) < 12:
         return False
     corpus = _norm(" ".join(p.get("text", "") for p in passages))
-    return q in corpus
+    if q in corpus:
+        return True
+    # Fuzzy fallback: ≥65% of content words (len>5) must appear in the corpus.
+    # Using len>5 avoids short function words ("with", "from") skewing the score.
+    words = [w for w in q.split() if len(w) > 5]
+    if not words:
+        return False
+    return sum(1 for w in words if w in corpus) / len(words) >= 0.65
 
 
 def _validate(obj: dict, passages: list) -> dict | None:
     if not isinstance(obj, dict):
         return None
-    level     = obj.get("ploidy_level")
-    mechanism = obj.get("mechanism")
-    quote     = obj.get("evidence_quote") or ""
-    explicit  = bool(obj.get("stated_explicitly"))
+    level         = obj.get("ploidy_level")
+    mechanism     = obj.get("mechanism")
+    quote         = obj.get("evidence_quote") or ""
+    explicit      = bool(obj.get("stated_explicitly"))
+    conf_str      = str(obj.get("confidence") or "").lower().strip()
+    chrom_formula = obj.get("chromosome_formula")
+    evidence_type = obj.get("evidence_type")
+    ambiguity     = obj.get("ambiguity_note")
 
-    # normalise level
+    # normalise level: accept integer, numeric string, or ploidy word form
+    _WORD_LEVEL = {
+        "haploid": 1, "monoploid": 1,
+        "diploid": 2,
+        "triploid": 3,
+        "tetraploid": 4,
+        "pentaploid": 5,
+        "hexaploid": 6, "allohexaploid": 6, "autohexaploid": 6,
+        "heptaploid": 7,
+        "octoploid": 8, "octaploid": 8, "allooctoploid": 8,
+        "decaploid": 10,
+        "dodecaploid": 12,
+    }
     if isinstance(level, str):
-        m = re.search(r"\d+", level)
-        level = int(m.group()) if m else None
+        lv = level.lower().strip()
+        if lv in _WORD_LEVEL:
+            level = _WORD_LEVEL[lv]
+        else:
+            m = re.search(r"\d+", lv)
+            level = int(m.group()) if m else None
     if not isinstance(level, int):
         level = None
 
-    # mechanism must be in the controlled vocabulary
+    # Normalise mechanism to controlled vocabulary.
+    # The model sometimes puts the full ploidy word or even a sentence — scan for
+    # keywords so we still extract signal even when instructions are partially ignored.
+    _MECH_KEYWORDS = [
+        ("segmental allopolyploid",    "segmental_allopolyploid"),
+        ("segmental_allopolyploid",    "segmental_allopolyploid"),
+        ("amphidiploid",               "amphidiploid"),
+        ("amphitetraploid",            "amphidiploid"),
+        ("allotetraploid",             "allopolyploid"),
+        ("allohexaploid",              "allopolyploid"),
+        ("allooctoploid",              "allopolyploid"),
+        ("allopolyploid",              "allopolyploid"),
+        ("allopolyploidization",       "allopolyploid"),
+        ("autotetraploid",             "autopolyploid"),
+        ("autohexaploid",              "autopolyploid"),
+        ("autopolyploid",              "autopolyploid"),
+    ]
+    if isinstance(mechanism, str):
+        m_lower = mechanism.lower().strip()
+        for keyword, controlled in _MECH_KEYWORDS:
+            if keyword in m_lower:
+                mechanism = controlled
+                break
+        else:
+            mechanism = None
     if mechanism not in VALID_MECHANISMS:
         mechanism = None
 
-    # grounding gate — if the claimed value is not backed by a real quote, drop it
+    # Infer mechanism from the evidence_quote when the model left it null
+    if mechanism is None and quote:
+        q_lower = quote.lower()
+        for keyword, controlled in _MECH_KEYWORDS:
+            if keyword in q_lower:
+                mechanism = controlled
+                break
+
+    # Grounding gate: the evidence_quote must appear verbatim in the passages.
+    # This anchors every claim — whether explicit or inferred — to actual paper text.
     grounded = _is_grounded(quote, passages)
-    if (level is not None or mechanism is not None):
-        if not explicit or not grounded:
-            print("  [gemma] value rejected (not explicit / not grounded in passages)")
-            level, mechanism = None, None
+    if (level is not None or mechanism is not None) and not grounded:
+        print("  [gemma] value rejected (evidence_quote not found in passages)")
+        level, mechanism = None, None
 
     # schema normalisation (mirror resolve_ploidy_fields)
     if level == 1:
@@ -191,18 +518,34 @@ def _validate(obj: dict, passages: list) -> dict | None:
     if level is None and mechanism is None:
         return None
 
+    # Map model's confidence string to a float.
+    # Inferred results get an 88% multiplier — they're valuable but less certain.
+    _CONF_MAP = {"high": 0.78, "medium": 0.62, "low": 0.45}
+    base_conf  = _CONF_MAP.get(conf_str, 0.55)
+    suggested  = not explicit
+    confidence = round(base_conf * (1.0 if explicit else 0.88), 2)
+    source     = "gemma_suggested" if suggested else "gemma_confirmed"
+    method     = "gemma_suggested" if suggested else "gemma"
+
+    if suggested:
+        print(f"  [gemma] suggested (inferred, not explicit): level={level} mech={mechanism} conf={conf_str}")
+
     return {
-        "level":       level,
-        "mechanism":   mechanism,
-        "irregular":   False,
-        "derivation":  None,
-        "tuple":       [level, mechanism, False, None],
-        "level_label": _LEVEL_LABEL.get(level) if level is not None else None,
-        "status":      "found_in_paper",
-        "source":      "gemma",
-        "confidence":  0.7,
-        "method":      "gemma",
-        "evidence":    quote.strip()[:300],
+        "level":            level,
+        "mechanism":        mechanism,
+        "irregular":        False,
+        "derivation":       None,
+        "tuple":            [level, mechanism, False, None],
+        "level_label":      _LEVEL_LABEL.get(level) if level is not None else None,
+        "status":           "found_in_paper",
+        "source":           source,
+        "confidence":       confidence,
+        "method":           method,
+        "suggested":        suggested,
+        "evidence":         quote.strip()[:300],
+        "evidence_type":    evidence_type,
+        "chromosome_formula": chrom_formula,
+        "ambiguity_note":   ambiguity,
     }
 
 
@@ -212,39 +555,81 @@ def run_gemma_ploidy(species: str, evidence_passages: list) -> dict | None:
     if not evidence_passages:
         return None
     print("\n  [gemma] querying local Gemma for ploidy (grounded extraction) ...")
-    raw = _call_vllm(species, evidence_passages)
-    if raw is None:
-        return None
-    return _validate(raw, evidence_passages)
+    # Priority: HTTP server > GGUF in-process > HF float32 direct
+    if _server_is_up():
+        raw = _call_vllm(species, evidence_passages)
+        if raw is not None:
+            return _validate(raw, evidence_passages)
+    if _gguf_available():
+        raw = _call_gguf(species, evidence_passages)
+        if raw is not None:
+            return _validate(raw, evidence_passages)
+    if _weights_available():
+        raw = _call_direct(species, evidence_passages)
+        if raw is not None:
+            return _validate(raw, evidence_passages)
+    return None
 
 
 def combine_with_gemma(ensemble: dict, gemma: dict | None) -> dict:
     if not gemma:
         return ensemble
 
-    out = dict(ensemble)
-    e_lvl, g_lvl = ensemble.get("level"), gemma.get("level")
+    out      = dict(ensemble)
+    e_lvl    = ensemble.get("level")
+    g_lvl    = gemma.get("level")
+    suggested = gemma.get("suggested", False)
 
-    if e_lvl is not None and g_lvl is not None and e_lvl == g_lvl:
-        out["confidence"] = min(round((ensemble.get("confidence", 0.5) + 0.2), 2), 0.98)
-        out["method"]     = "consensus_3way"
-        # prefer a non-null, more specific mechanism
-        if not out.get("mechanism") and gemma.get("mechanism"):
-            out["mechanism"] = gemma["mechanism"]
-            out["tuple"]     = [out["level"], out["mechanism"],
-                                out.get("irregular", False), out.get("derivation")]
-        out["gemma"] = {"level": g_lvl, "mechanism": gemma.get("mechanism"),
-                        "evidence": gemma.get("evidence")}
+    # Annotation that is always attached when Gemma has something to say
+    gemma_note = {
+        "level":     g_lvl,
+        "mechanism": gemma.get("mechanism"),
+        "evidence":  gemma.get("evidence"),
+        "suggested": suggested,
+    }
 
-    elif e_lvl is None and g_lvl is not None:
-        out = dict(gemma)
-        out["method"] = "gemma_only"
-        out["confidence"] = round(gemma.get("confidence", 0.7) * 0.9, 2)
+    if suggested:
+        # ── Gemma inferred (not explicitly stated) ──────────────────────────
+        # Never overwrite the ensemble result; attach as a suggestion only.
+        out["gemma_suggestion"] = gemma_note
+        if e_lvl is None and g_lvl is not None:
+            # Nothing from rule/vector — show Gemma's inference as a low-confidence hint
+            out["gemma_suggestion"]["note"] = (
+                "No result from rule-based or vector search. "
+                "Gemma inferred this level from genomic context — treat as a hint, "
+                "not a confirmed answer."
+            )
+        elif e_lvl is not None and g_lvl is not None and e_lvl == g_lvl:
+            # Gemma agrees with ensemble via inference — small confidence nudge
+            out["confidence"] = min(round(ensemble.get("confidence", 0.5) + 0.05, 2), 0.95)
+            out["gemma_suggestion"]["note"] = "Gemma inferred the same level; adds soft support."
+        elif e_lvl is not None and g_lvl is not None and e_lvl != g_lvl:
+            out["gemma_suggestion"]["note"] = (
+                f"Gemma inferred level={g_lvl}, which conflicts with the ensemble "
+                f"result of level={e_lvl}. Manual review recommended."
+            )
+    else:
+        # ── Gemma explicitly confirmed ───────────────────────────────────────
+        if e_lvl is not None and g_lvl is not None and e_lvl == g_lvl:
+            # All three sources agree → highest confidence
+            out["confidence"] = min(round(ensemble.get("confidence", 0.5) + 0.2, 2), 0.98)
+            out["method"]     = "consensus_3way"
+            if not out.get("mechanism") and gemma.get("mechanism"):
+                out["mechanism"] = gemma["mechanism"]
+                out["tuple"]     = [out["level"], out["mechanism"],
+                                    out.get("irregular", False), out.get("derivation")]
+            out["gemma"] = gemma_note
 
-    elif e_lvl is not None and g_lvl is not None and e_lvl != g_lvl:
-        out["method"] = f"conflict_rule_vector_vs_gemma ({e_lvl} vs {g_lvl})"
-        out["confidence"] = round(ensemble.get("confidence", 0.5) * 0.8, 2)
-        out["gemma"] = {"level": g_lvl, "mechanism": gemma.get("mechanism"),
-                        "evidence": gemma.get("evidence")}
+        elif e_lvl is None and g_lvl is not None:
+            # Rule/vector found nothing; Gemma found an explicit statement
+            out = dict(gemma)
+            out["method"]     = "gemma_only"
+            out["confidence"] = round(gemma.get("confidence", 0.7) * 0.9, 2)
+
+        elif e_lvl is not None and g_lvl is not None and e_lvl != g_lvl:
+            # Explicit conflict — flag for manual review
+            out["method"]     = f"conflict_rule_vector_vs_gemma ({e_lvl} vs {g_lvl})"
+            out["confidence"] = round(ensemble.get("confidence", 0.5) * 0.8, 2)
+            out["gemma"]      = gemma_note
 
     return out

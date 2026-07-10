@@ -152,6 +152,7 @@ def run_pipeline(accession: str, max_results: int = 5) -> dict:
         g = gemma.run_gemma_ploidy(
             final["species"]["value"],
             final["ploidy"].get("evidence_passages", []),
+            accession=accession,
         )
         if g is not None:
             final["ploidy"] = combine_with_gemma(final["ploidy"], g)

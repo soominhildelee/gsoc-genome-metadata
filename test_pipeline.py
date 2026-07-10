@@ -29,6 +29,70 @@ TEST_CASES = [
         "expected_mechanism": {"allopolyploid", "amphidiploid", None},
         "expected_species":   "Triticum aestivum",
     },
+    {
+        "accession":          "GCA_905183035.1",
+        "description":        "Brassica napus (oilseed rape) — tetraploid amphidiploid",
+        "expected_level":     4,
+        "expected_mechanism": {"amphidiploid", "allopolyploid", None},
+        "expected_species":   "Brassica napus",
+    },
+    {
+        "accession":          "GCA_007990345.1",
+        "description":        "Gossypium hirsutum (upland cotton) — allotetraploid",
+        "expected_level":     4,
+        "expected_mechanism": {"allopolyploid", "amphidiploid", None},
+        "expected_species":   "Gossypium hirsutum",
+    },
+    {
+        "accession":          "GCA_050043575.1",
+        "description":        "Fragaria x ananassa (strawberry) — octoploid",
+        "expected_level":     8,
+        "expected_mechanism": {"allopolyploid", None},
+        "expected_species":   "Fragaria",
+    },
+    {
+        "accession":          "GCA_002210045.1",
+        "description":        "Nicotiana tabacum (tobacco) — allotetraploid (Nitab4.5)",
+        "expected_level":     4,
+        "expected_mechanism": {"allopolyploid", "amphidiploid", None},
+        "expected_species":   "Nicotiana tabacum",
+    },
+    {
+        "accession":          "GCA_951802365.1",
+        "description":        "Avena sativa (oat) — allohexaploid (cv. Morgan)",
+        "expected_level":     6,
+        "expected_mechanism": {"allopolyploid", None},
+        "expected_species":   "Avena sativa",
+    },
+    # ── New test cases ─────────────────────────────────────────────────────
+    {
+        "accession":          "GCA_038442765.1",
+        "description":        "Panicum miliaceum (broomcorn millet) — allotetraploid, text says tetraploid, subgenomes A+B in chromosome names",
+        "expected_level":     4,
+        "expected_mechanism": {"allopolyploid", None},
+        "expected_species":   "Panicum miliaceum",
+    },
+    {
+        "accession":          "GCA_902651665.1",
+        "description":        "Triticum aestivum (TRITEX paper) — hexaploid; same paper also has T. turgidum tetraploid (disambiguation test)",
+        "expected_level":     6,
+        "expected_mechanism": {"allopolyploid", "amphidiploid", None},
+        "expected_species":   "Triticum aestivum",
+    },
+    {
+        "accession":          "GCA_009802035.1",
+        "description":        "Triticum turgidum ssp. dicoccoides (TRITEX paper) — tetraploid; same paper as T. aestivum above (disambiguation test)",
+        "expected_level":     4,
+        "expected_mechanism": {"allopolyploid", "amphidiploid", None},
+        "expected_species":   "Triticum",
+    },
+    {
+        "accession":          "GCA_030015575.1",
+        "description":        "Agapanthus africanus (African lily) — tetraploid, indicated as 2n = 4x = 30 in paper",
+        "expected_level":     4,
+        "expected_mechanism": {"autopolyploid", "allopolyploid", None},
+        "expected_species":   "Agapanthus",
+    },
 ]
 
 

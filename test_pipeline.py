@@ -15,13 +15,10 @@ TEST_CASES = [
         "expected_mechanism": {None},
         "expected_species":   "Arabidopsis thaliana",
     },
-    {
-        "accession":          "GCA_003086295.3",
-        "description":        "Arachis hypogaea (peanut) — segmental allotetraploid",
-        "expected_level":     4,
-        "expected_mechanism": {"segmental_allopolyploid", "allopolyploid", None},
-        "expected_species":   "Arachis hypogaea",
-    },
+    # NOTE: Arachis hypogaea (peanut, GCA_003086295.3) was removed from the
+    # benchmark as an outlier — it was the hand-tuned seed case used while
+    # building the rule extractor, so it does not measure generalisation. It
+    # remains in accessions.txt for the broad robustness sweep.
     {
         "accession":          "GCA_002220415.3",
         "description":        "Triticum aestivum (wheat) — hexaploid (amphidiploid)",

@@ -1,0 +1,81 @@
+# Robustness test accessions — balanced across ploidy levels and kingdoms.
+# Format: one GCA accession per line; text after "#" is an inline note
+# (species / expected ploidy level) and is ignored by the harness.
+#
+# NOTE: GCA version suffixes (.N) drift over time. Any line whose version is
+# stale will simply be logged by the harness as no_papers / error — that is
+# expected, just bump the version. Run a small dry run first:
+#     python robustness_test.py --accessions accessions.txt --limit 5
+#
+# The 5 marked (verified) were confirmed current at list-creation time.
+
+# ============================================================
+# DIPLOID — plants (expected level 2)
+# ============================================================
+GCA_000001735.2    # Arabidopsis thaliana (2)  (verified)
+GCA_000188115.5    # Solanum lycopersicum / tomato (2)  (verified)
+GCA_001433935.1    # Oryza sativa Japonica / rice (2)
+GCA_902167145.1    # Zea mays B73 / maize (2; paleopolyploid)
+GCA_000004515.5    # Glycine max / soybean (2; paleotetraploid)
+GCA_000003195.3    # Sorghum bicolor (2)
+GCA_000327005.1    # Musa acuminata / banana (2)
+GCA_000143415.4    # Medicago truncatula (2)
+GCA_000002775.4    # Populus trichocarpa / poplar (2)
+GCA_000146045.2    # Saccharomyces cerevisiae S288C / yeast (reference is haploid)
+GCA_000002765.3    # Plasmodium falciparum 3D7 (1)
+GCA_000005845.2    # Escherichia coli K-12 MG1655 (1; monoploid)
+
+# ============================================================
+# DIPLOID — animals (expected level 2)
+# ============================================================
+GCA_000001405.15   # Homo sapiens GRCh38 (2)
+GCA_000001635.9    # Mus musculus GRCm39 (2)
+GCA_000002035.4    # Danio rerio / zebrafish GRCz11 (2)
+GCA_000001215.4    # Drosophila melanogaster (2)
+GCA_000002985.3    # Caenorhabditis elegans (2)
+GCA_000003025.6    # Sus scrofa / pig 11.1 (2)
+GCA_002263795.2    # Bos taurus / cattle ARS-UCD1.2 (2)
+GCA_016699485.1    # Gallus gallus / chicken bGalGal1 (2)
+GCA_000181335.4    # Felis catus / cat (2)
+GCA_000349665.1    # Oryctolagus cuniculus / rabbit (2)
+
+# ============================================================
+# POLYPLOID (expected level >= 3) — the hard / interesting cases
+# ============================================================
+GCA_003086295.3    # Arachis hypogaea / peanut (4, segmental allopolyploid)  (verified)
+GCA_002220415.3    # Triticum aestivum / bread wheat (6, allopolyploid)  (verified)
+GCA_905183035.1    # Brassica napus / oilseed rape (4, amphidiploid)  (verified)
+GCA_007990345.1    # Gossypium hirsutum / upland cotton (4, allotetraploid)
+GCA_002162155.1    # Triticum turgidum dicoccoides / wild emmer (4)
+GCA_900231445.1    # Triticum turgidum durum / durum wheat (4)
+GCA_003713225.1    # Coffea arabica / arabica coffee (4, allotetraploid)
+GCA_000226075.1    # Solanum tuberosum / potato DM (reference is doubled-monoploid)
+GCA_003254565.1    # Fragaria x ananassa / strawberry (8, octoploid)
+GCA_000442705.1    # Nicotiana tabacum / tobacco (4, allotetraploid)
+GCA_018446385.1    # Avena sativa / oat (6, allohexaploid)
+GCA_900519105.1    # Triticum durum (4)
+
+# ============================================================
+# DIPLOID — more non-model eukaryotes (expected level 2)
+# ============================================================
+GCA_000146465.1    # Volvox carteri (2)
+GCA_000002595.2    # Chlamydomonas reinhardtii (1; haploid alga)
+GCA_000182925.2    # Neurospora crassa (1; haploid fungus)
+GCA_000001215.4    # (dup of Drosophila — kept to test dedupe of accession list)
+GCA_002263795.2    # (dup of cattle — same)
+GCA_000146795.3    # Aspergillus fumigatus (1)
+GCA_000002545.2    # Candida albicans (2)
+GCA_000091225.2    # Ostreococcus tauri (1)
+GCA_000002725.2    # Trypanosoma brucei (2)
+GCA_000208615.1    # Tetrahymena thermophila
+
+# ============================================================
+# DIPLOID — additional animals (expected level 2)
+# ============================================================
+GCA_000146605.4    # Meleagris gallopavo / turkey (2)
+GCA_000003625.1    # Monodelphis domestica / opossum (2)
+GCA_000004665.1    # Callithrix jacchus / marmoset (2)
+GCA_000165445.3    # Microcebus murinus / mouse lemur (2)
+GCA_000151735.1    # Bombyx mori / silkworm (2)
+GCA_000002315.5    # Gallus gallus GRCg6a (2)
+GCA_000005005.6    # Zea mays B73 RefGen_v4 (2) (alt maize version)

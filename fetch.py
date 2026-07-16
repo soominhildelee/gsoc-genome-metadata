@@ -7,7 +7,10 @@ import requests
 # STEP 1 — Get assembly info from NCBI
 # ============================================================
 
-def fetch_assembly_metadata(accession: str) -> dict:
+def _fetch_assembly_report(accession: str) -> list:
+    """Query NCBI Datasets for one accession's dataset report; return the raw
+    reports list (empty on any failure). Isolated so callers can retry with a
+    different accession form (e.g. version-less) without duplicating HTTP logic."""
     url = (
         f"https://api.ncbi.nlm.nih.gov/datasets/v2/genome/accession"
         f"/{accession}/dataset_report"
@@ -15,16 +18,25 @@ def fetch_assembly_metadata(accession: str) -> dict:
     try:
         response = requests.get(url, timeout=30)
         response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as e:
+        return response.json().get("reports", [])
+    except (requests.RequestException, ValueError) as e:
         print(f"  [NCBI] Failed to fetch {accession}: {e}")
-        return {
-            "assembly_accession": accession,
-            "chromosome_number":  None,
-            "chromosome_source":  None,
-        }
+        return []
 
-    reports = data.get("reports", [])
+
+def fetch_assembly_metadata(accession: str) -> dict:
+    reports = _fetch_assembly_report(accession)
+
+    # A stale version suffix (e.g. GCA_000001405.15 when .29 is current) makes
+    # NCBI return an empty report. A version-less accession resolves to the
+    # latest version, so retry without the ".N" suffix before giving up — this
+    # keeps the pipeline working when accession lists drift out of date.
+    resolved_accession = accession
+    if not reports and "." in accession:
+        base = accession.split(".")[0]
+        print(f"  [NCBI] No report for {accession}; retrying latest version ({base}) ...")
+        reports = _fetch_assembly_report(base)
+
     if not reports:
         print(f"  [NCBI] No report found for {accession}")
         return {
@@ -34,6 +46,7 @@ def fetch_assembly_metadata(accession: str) -> dict:
         }
 
     report         = reports[0]
+    resolved_accession = report.get("accession") or resolved_accession
     assembly_info  = report.get("assembly_info", {})
     organism       = report.get("organism", {})
     assembly_stats = report.get("assembly_stats", {})
@@ -54,7 +67,7 @@ def fetch_assembly_metadata(accession: str) -> dict:
     )
 
     return {
-        "assembly_accession": accession,
+        "assembly_accession": resolved_accession,
         "assembly_name":      assembly_info.get("assembly_name"),
         "taxon_id":           str(organism.get("tax_id", "")),
         "scientific_name":    organism.get("organism_name"),
@@ -190,6 +203,15 @@ GENOME_KEYWORDS = [
     "chromosome-level", "chromosome-scale", "de novo assembly",
     "whole genome", "whole-genome", "genome of",
 ]
+# Phrases that mark the target organism as a *habitat/host*, not the subject
+# of the paper — e.g. "Draft genome of Bacillus ... isolated from cotton". Such
+# papers mention the target's name only as the source and otherwise score high
+# on name + genome keywords, so they need a hard penalty (see scorer).
+HOST_CONTEXT_KEYWORDS = [
+    "isolated from", "associated with", "endophyt", "rhizosphere",
+    "phyllosphere", "symbiont", "symbiotic bacteri", "pathogen of",
+    "microbiome", "microbiota", "gut of", "gut microb",
+]
 PLOIDY_HINTS = [
     "diploid", "triploid", "tetraploid", "pentaploid", "hexaploid",
     "octoploid", "polyploid", "allopolyploid", "autopolyploid",
@@ -248,11 +270,28 @@ def score_paper_candidate(paper: dict, identifiers: dict) -> float:
     if paper.get("is_reference_paper"):
         score += 2.5
 
+    # Full-text-confirmed species source: the exact binomial was found in the
+    # article body (confirmation pass in fetch_papers_for_assembly) even though
+    # it is absent from title/abstract — a multi-species / methods paper that
+    # assembled this genome. Reward it like a strong name-in-title match so it
+    # can outrank an off-target paper that merely names the species up front.
+    if paper.get("_fulltext_name_confirmed"):
+        score += 4.0
+
     # organelle penalty (a chloroplast/mito paper must never rank as a strong
     # nuclear-genome candidate, so the title penalty is large)
     if any(k in title for k in ORGANELLE_KEYWORDS):
         score -= 10.0
     elif any(k in abstract for k in ORGANELLE_KEYWORDS):
+        score -= 2.0
+
+    # host-context penalty: a paper about a microbe *isolated from* / *associated
+    # with* the target (e.g. "Draft genome of Bacillus ... isolated from cotton")
+    # names the target only as its habitat. These otherwise rank top on
+    # name + genome-keyword hits, so penalise as hard as organelle papers.
+    if any(k in title for k in HOST_CONTEXT_KEYWORDS):
+        score -= 10.0
+    elif any(k in abstract for k in HOST_CONTEXT_KEYWORDS):
         score -= 2.0
 
     return score
@@ -365,6 +404,29 @@ def search_europe_pmc_by_name(
 
     print(f"  [EuropePMC] No relevant papers found for {scientific_name}")
     return []
+
+
+def search_europe_pmc_fulltext(scientific_name: str, max_results: int = 5) -> list:
+    """Find candidate source papers that mention the exact species binomial in
+    their FULL TEXT even when the title/abstract does not — e.g. a multi-species
+    or methods paper that assembled this genome (the true source of many
+    assemblies). Europe PMC's search covers open-access full text, so a quoted
+    binomial query surfaces them. We deliberately skip the genus-in-title guard
+    here (that guard drops exactly these papers) and instead return only
+    open-access hits, tagged for a full-text confirmation pass in the caller."""
+    if not scientific_name:
+        return []
+    query = f'"{scientific_name}" AND (genome OR assembly OR chromosome OR ploidy)'
+    out = []
+    for r in search_europe_pmc(query, max_results=max_results * 3):
+        if r.get("pmcid") or r.get("pmCid"):
+            r["_needs_fulltext_confirm"] = True
+            out.append(r)
+        if len(out) >= max_results * 2:
+            break
+    if out:
+        print(f"  [EuropePMC] Full-text species search: {len(out)} open-access candidate(s)")
+    return out
 
 
 def has_usable_fulltext(papers: list[dict]) -> bool:
@@ -501,6 +563,12 @@ def fetch_bioproject_reference_papers(accession: str, max_results: int = 5) -> l
             papers.append(paper)
             print(f"  [BioProject] {pmid}: {paper.get('title', '')[:60]}...")
     return papers
+
+
+def search_ncbi_entrez(scientific_name: str, max_results: int = 5) -> list:
+    """NCBI Entrez PMC search fallback: query PubMed Central for open-access
+    genome-assembly papers by scientific name. Used when accession links and the
+    Europe PMC name search fail to surface a strong genome paper."""
     print(f"  [NCBI Entrez] Searching PubMed Central for {scientific_name} ...")
 
     # Step 1: search for PMC IDs
@@ -651,6 +719,101 @@ def get_fulltext_by_pmcid(pmcid: str) -> str | None:
     return None
 
 
+def _strip_markup(s: str) -> str:
+    try:
+        from bs4 import BeautifulSoup
+        return BeautifulSoup(s, "html.parser").get_text(" ")
+    except Exception:
+        return _re.sub(r"<[^>]+>", " ", s)
+
+
+def _xlsx_shared_strings(raw: bytes) -> str:
+    """Extract shared-string text from an .xlsx (itself a zip) without openpyxl.
+    This catches column headers / row labels ('2n', 'chromosome number', ploidy
+    words) that carry the ploidy signal; numeric cell values are not needed for
+    that. Returns '' if the file is not a readable xlsx."""
+    import io, zipfile
+    try:
+        inner = zipfile.ZipFile(io.BytesIO(raw))
+        if "xl/sharedStrings.xml" not in inner.namelist():
+            return ""
+        xml = inner.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    return " ".join(_re.findall(r"<t[^>]*>([^<]+)</t>", xml))
+
+
+def _docx_text(raw: bytes) -> str:
+    """Extract paragraph text from a .docx (itself a zip) without python-docx:
+    read word/document.xml and pull the <w:t> text runs. Supplementary tables
+    are very commonly distributed as .docx, so this materially widens coverage.
+    Returns '' if the file is not a readable docx."""
+    import io, zipfile
+    try:
+        inner = zipfile.ZipFile(io.BytesIO(raw))
+        if "word/document.xml" not in inner.namelist():
+            return ""
+        xml = inner.read("word/document.xml").decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    return " ".join(_re.findall(r"<w:t[^>]*>([^<]*)</w:t>", xml))
+
+
+def get_supplementary_text_by_pmcid(pmcid: str, max_chars: int = 40000) -> str | None:
+    """Download the Europe PMC supplementary-files ZIP for a PMC article and
+    extract plain text from the members we can read without heavy dependencies:
+    txt/csv/tsv, html/xml, and xlsx shared strings. Ploidy evidence —
+    chromosome counts, karyotype tables, '2n = ...' formulas — often lives in
+    supplementary tables rather than the article body, so this widens what the
+    extractor can see. Binary formats we cannot read dependency-free (pdf, docx,
+    images) are skipped. Returns one concatenated string, or None if nothing
+    usable was found."""
+    import io, zipfile
+
+    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/supplementaryFiles"
+    try:
+        resp = requests.get(url, timeout=60)
+        if resp.status_code != 200 or not resp.content:
+            return None
+    except requests.RequestException:
+        return None
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    except zipfile.BadZipFile:
+        return None
+
+    parts, total = [], 0
+    for name in zf.namelist():
+        if total >= max_chars:
+            break
+        lower = name.lower()
+        try:
+            raw = zf.read(name)
+        except Exception:
+            continue
+        if lower.endswith((".txt", ".csv", ".tsv", ".tab")):
+            text = raw.decode("utf-8", errors="ignore")
+        elif lower.endswith((".html", ".htm", ".xml")):
+            text = _strip_markup(raw.decode("utf-8", errors="ignore"))
+        elif lower.endswith(".xlsx"):
+            text = _xlsx_shared_strings(raw)
+        elif lower.endswith(".docx"):
+            text = _docx_text(raw)
+        else:
+            continue   # pdf / legacy .doc / images: not readable dependency-free
+        text = _re.sub(r"[ \t\r\n\f\v]+", " ", text).strip()
+        if text:
+            snippet = text[: max_chars - total]
+            parts.append(f"[Supplementary file: {name}]\n{snippet}")
+            total += len(snippet)
+
+    if not parts:
+        return None
+    print(f"  [supp] extracted text from {len(parts)} supplementary file(s) for {pmcid}")
+    return "\n\n".join(parts)
+
+
 def get_abstract_by_pmid(pmid: str) -> str | None:
     paper = search_by_pmid(pmid)
     if paper:
@@ -665,7 +828,11 @@ def get_best_available_text(paper: dict) -> dict:
     if pmcid:
         fulltext = get_fulltext_by_pmcid(pmcid)
         if fulltext:
-            return {"source": "fulltext", "pmcid": pmcid, "text": fulltext}
+            out = {"source": "fulltext", "pmcid": pmcid, "text": fulltext}
+            supp = get_supplementary_text_by_pmcid(pmcid)
+            if supp:
+                out["supplementary"] = supp
+            return out
 
     if pmid:
         abstract = get_abstract_by_pmid(pmid)
@@ -689,6 +856,9 @@ def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
     print(f"\n[1/4] Fetching assembly metadata for {accession} ...")
     assembly        = fetch_assembly_metadata(accession)
     assembly        = enrich_assembly_metadata(assembly)   # common_name + GoaT reference via taxon_id
+    # fetch_assembly_metadata may have resolved a stale version to the latest;
+    # use that for all downstream accession-based lookups (elink, BioProject).
+    accession       = assembly.get("assembly_accession", accession) or accession
     scientific_name = assembly.get("scientific_name", "") or ""
     common_name     = assembly.get("common_name", "") or ""
     taxon_id        = assembly.get("taxon_id", "") or ""
@@ -757,6 +927,16 @@ def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
             p.setdefault("retrieval_source", "europepmc_name")
             candidates.append(p)
 
+    # Priority 3c: full-text species search. When no clearly-strong genome paper
+    # has surfaced, the true source may be a multi-species / methods paper that
+    # names this species only in its body (e.g. an assembly reported alongside
+    # others). Search Europe PMC full text and pool the open-access hits; a
+    # confirmation pass below verifies each before it can rank.
+    if strongest(candidates) < STRONG_SCORE + 2.0:
+        for p in search_europe_pmc_fulltext(scientific_name, max_results=max_results):
+            p.setdefault("retrieval_source", "europepmc_fulltext")
+            candidates.append(p)
+
     # Priority 4: NCBI Entrez PMC search — still no strong candidate
     if strongest(candidates) < STRONG_SCORE:
         print(f"\n[2/4] Trying NCBI Entrez PMC search for {scientific_name} ...")
@@ -773,6 +953,30 @@ def fetch_papers_for_assembly(accession: str, max_results: int = 5) -> dict:
 
     if not candidates:
         print(f"\n[2/4] All search sources exhausted. No papers found.")
+
+    # ---- full-text confirmation pass ----
+    # Candidates tagged _needs_fulltext_confirm matched the species only in their
+    # full text. Fetch the text and keep only those where the exact binomial
+    # really appears (marking them so scoring can reward a genuine source); drop
+    # spurious matches. Bounded to a few fetches so cost stays predictable.
+    sci_lower = scientific_name.lower()
+    confirmed, ft_checks = [], 0
+    for p in candidates:
+        if not p.get("_needs_fulltext_confirm"):
+            confirmed.append(p)
+            continue
+        pmcid = p.get("pmcid") or p.get("pmCid")
+        if pmcid and ft_checks < 5:
+            ft_checks += 1
+            ft = get_fulltext_by_pmcid(pmcid)
+            if ft and sci_lower in ft.lower():
+                p["_fulltext_name_confirmed"] = True
+                p.pop("_needs_fulltext_confirm", None)
+                confirmed.append(p)
+                print(f"      [fulltext-confirm] {scientific_name} found in {pmcid}: "
+                      f"{p.get('title', '')[:55]}...")
+            # else: species not actually in the body -> drop spurious match
+    candidates = confirmed
 
     # ---- de-duplicate across sources + rank best-first by relevance ----
     papers_found = _dedupe_and_rank(candidates, identifiers)

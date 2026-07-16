@@ -3,7 +3,11 @@ from xml.etree import ElementTree as ET
 
 _TEX_BLOCK = re.compile(r"\\documentclass.*?\\end\{document\}", re.DOTALL)
 _TEX_CMD   = re.compile(r"\\[a-zA-Z]+\s*(\[[^\]]*\])?(\{[^}]*\})?")
-_WS        = re.compile(r"[ \t\r\n\f\v]+")
+# Match ALL whitespace incl. Unicode (thin space U+2009, nbsp U+00A0, …). Genome
+# papers often typeset chromosome formulas as "2n = 4x = 30"
+# with thin spaces; normalising them to plain spaces lets the extractor's regex
+# read the formula.
+_WS        = re.compile(r"\s+")
 
 
 def clean_text(text: str) -> str:
@@ -127,6 +131,28 @@ def parse_abstract(abstract_text: str) -> dict[str, str]:
     return {"Abstract": clean_text(abstract_text)}
 
 
+def parse_supplementary(supp_text: str) -> dict[str, str]:
+    """Turn the concatenated supplementary blob from fetch.py into sections,
+    one per file. Each block starts with a '[Supplementary file: <name>]'
+    marker (see get_supplementary_text_by_pmcid). Section titles are prefixed
+    'Supplementary:' so downstream section weighting can recognise them."""
+    if not supp_text:
+        return {}
+    sections = {}
+    blocks = re.split(r"\[Supplementary file:\s*([^\]]+)\]", supp_text)
+    # re.split keeps capture groups: [pre, name1, body1, name2, body2, ...]
+    for i in range(1, len(blocks) - 1, 2):
+        name = blocks[i].strip()
+        body = clean_text(blocks[i + 1])
+        if body:
+            sections[f"Supplementary: {name}"] = body
+    if not sections:  # no markers found — keep as one section
+        body = clean_text(supp_text)
+        if body:
+            sections["Supplementary"] = body
+    return sections
+
+
 def split_into_chunks(sections: dict[str, str], chunk_size: int = 300) -> list[dict]:
     chunks = []
     for sec_title, text in sections.items():
@@ -178,6 +204,13 @@ def parse_paper(text_data: dict) -> dict:
     else:
         sections = parse_abstract(text)
         print(f"  [parse] Plain abstract wrapped as single section")
+
+    # Fold in supplementary-file text (chromosome/karyotype tables often live
+    # here, not in the article body). Attached by fetch.get_best_available_text.
+    supp_sections = parse_supplementary(text_data.get("supplementary", ""))
+    if supp_sections:
+        sections.update(supp_sections)
+        print(f"  [parse] + {len(supp_sections)} supplementary section(s)")
 
     chunks = split_into_chunks(sections)
     print(f"  [parse] {len(chunks)} chunks ready for extract.py and search.py")

@@ -17,6 +17,13 @@ venv/
 .DS_Store
 .vscode/
 
+# large / generated artefacts
+*.log
+*.zip
+robustness_cache/
+robustness_results.json
+robustness_summary.csv
+
 *.ipynb
 *.png
 models/

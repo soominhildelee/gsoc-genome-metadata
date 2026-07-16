@@ -29,3 +29,7 @@ robustness_summary.csv
 models/
 iML1515_ectoine.xml
 cbe567*
+
+pipelines/nextflow/results/
+pipelines/nextflow/work/
+pipelines/nextflow/.nextflow*

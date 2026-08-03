@@ -14,6 +14,6 @@ process MERGE_RESULTS {
 
     script:
     """
-    python3 -c "import glob, json; files=[f for f in sorted(glob.glob('*.json')) if f!='results.json']; merged=[json.load(open(f)) for f in files]; json.dump(merged, open('results.json','w'), indent=2, ensure_ascii=False); print('merged', len(merged), 'result(s)')"
+    conda run -n ${params.conda_env} python -c "import glob, json; files=[f for f in sorted(glob.glob('*.json')) if f!='results.json']; merged=[json.load(open(f)) for f in files]; json.dump(merged, open('results.json','w'), indent=2, ensure_ascii=False); print('merged', len(merged), 'result(s)')"
     """
 }

@@ -363,7 +363,12 @@ def search_europe_pmc_by_name(
     common_name:     str = "",
     max_results:     int = 5,
 ) -> list:
-    genus = scientific_name.split()[0] if scientific_name else ""
+    tokens = scientific_name.split() if scientific_name else []
+    genus  = tokens[0] if tokens else ""
+    # Binomial = genus + species epithet. For a subspecies / variety / hybrid
+    # (e.g. "Oryza meyeriana var. indandamanica") the full trinomial rarely
+    # appears in a paper, but the binomial ("Oryza meyeriana") usually does.
+    binomial = " ".join(tokens[:2]) if len(tokens) >= 2 else ""
 
     # Multi-identifier name clause: scientific name, plus common name when
     # it is specific enough to be useful (>= 4 chars avoids junk like "fly").
@@ -378,7 +383,20 @@ def search_europe_pmc_by_name(
         f'{name_clause} AND ("genome sequence" OR ploidy OR chromosome)',
         # 3rd priority: scientific name + genome sequence
         f'"{scientific_name}" AND "genome sequence"',
-        # 4th priority: taxon ID fallback (last resort)
+    ]
+
+    # 4th priority: taxonomic fallback. When the full name is a trinomial
+    # (subspecies / variety / hybrid), drop to the binomial, then the genus,
+    # before the taxon-ID last resort. The genus relevance filter below still
+    # applies, so this widens recall without inviting unrelated papers.
+    if binomial and binomial != scientific_name:
+        queries += [
+            f'"{binomial}" AND "genome assembly"',
+            f'"{binomial}" AND ("genome sequence" OR ploidy OR chromosome)',
+        ]
+
+    queries += [
+        # 5th priority: taxon ID fallback (last resort)
         f"TAXONOMY:{taxon_id} AND genome assembly",
     ]
 

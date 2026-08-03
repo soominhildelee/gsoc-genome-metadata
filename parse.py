@@ -3,6 +3,7 @@ from xml.etree import ElementTree as ET
 
 _TEX_BLOCK = re.compile(r"\\documentclass.*?\\end\{document\}", re.DOTALL)
 _TEX_CMD   = re.compile(r"\\[a-zA-Z]+\s*(\[[^\]]*\])?(\{[^}]*\})?")
+_HTML_TAG  = re.compile(r"<[^>]+>")
 # Match ALL whitespace incl. Unicode (thin space U+2009, nbsp U+00A0, …). Genome
 # papers often typeset chromosome formulas as "2n = 4x = 30"
 # with thin spaces; normalising them to plain spaces lets the extractor's regex
@@ -128,7 +129,11 @@ def parse_xml_sections(xml_text: str) -> dict[str, str]:
 
 
 def parse_abstract(abstract_text: str) -> dict[str, str]:
-    return {"Abstract": clean_text(abstract_text)}
+    # Abstract snippets from search results sometimes carry stray markup
+    # (e.g. "<title>Abstract</title> <p>..."); strip tags before cleaning so
+    # the section body is plain text.
+    text = _HTML_TAG.sub(" ", abstract_text or "")
+    return {"Abstract": clean_text(text)}
 
 
 def parse_supplementary(supp_text: str) -> dict[str, str]:
@@ -201,6 +206,13 @@ def parse_paper(text_data: dict) -> dict:
     if text_type == "xml":
         sections = parse_xml_sections(text)
         print(f"  [parse] XML parsed → {len(sections)} sections")
+        # Fallback: an abstract snippet that merely *starts* with a tag
+        # (e.g. "<title>Abstract</title> <p>...") is not a full PMC article, so
+        # the XML parser yields nothing. Treat it as an abstract instead.
+        if not sections:
+            sections = parse_abstract(text)
+            print(f"  [parse] XML yielded 0 sections → fell back to abstract "
+                  f"({len(sections)} section)")
     else:
         sections = parse_abstract(text)
         print(f"  [parse] Plain abstract wrapped as single section")

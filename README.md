@@ -1,5 +1,9 @@
 # Assembly Metadata Extractor
 
+> **Google Summer of Code 2026 (EMBL-EBI / Ensembl).** For the GSoC final report
+> (goals, what was done, current state, what is left, upstream contribution, and
+> challenges) see **[WORK_PRODUCT.md](WORK_PRODUCT.md)**.
+
 Automatically extracts genomic metadata from genome-assembly papers, given an
 NCBI assembly accession. For each accession the pipeline finds the linked
 publication, reads its text (including supplementary files), and extracts:

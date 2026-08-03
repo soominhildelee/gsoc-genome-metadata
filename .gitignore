@@ -30,6 +30,11 @@ models/
 iML1515_ectoine.xml
 cbe567*
 
-pipelines/nextflow/results/
-pipelines/nextflow/work/
+# Nextflow run artefacts (work/results dirs, any suffix) — thousands of scratch files
+pipelines/nextflow/work*/
+pipelines/nextflow/results*/
 pipelines/nextflow/.nextflow*
+.nextflow*
+work/
+# large generated accession lists
+accessions_plants_large.txt

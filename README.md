@@ -23,31 +23,47 @@ rather than guessing when the text offers no evidence.
 
 ## Results
 
-- **Curated benchmark:** 11 / 11 assemblies pass with the full pipeline
-  (10 / 11 with rule + vector only).
-- **Scale test:** run over 1,059 arbitrary plant assemblies with zero unhandled
-  crashes, extracting a species for 98% and a paper-grounded ploidy for 67%
-  (spanning haploid to decaploid).
+**Curated benchmark:** 11 / 11 assemblies pass with the full pipeline
+(10 / 11 with rule + vector only).
+
+**Scale test on 1,059 arbitrary plant assemblies** (measures robustness and
+coverage, not accuracy, since there is no ground truth):
+
+| Metric | Result |
+| --- | --- |
+| Assemblies processed | 1,059 |
+| Unhandled crashes | **0** |
+| Species extracted | 1,047 / 1,059 (98%) |
+| Ploidy recovered (all paper-grounded) | 713 / 1,059 (67%) |
+| Sex identified | 164 / 1,059 |
+| Cultivar / strain found | 391 / 1,059 |
+
+**Ploidy distribution** (of the 713 assemblies where ploidy was found), a
+biologically sensible spread from haploid to decaploid:
+
+| Ploidy | Count | |
+| --- | ---: | --- |
+| L2 diploid | 467 | ██████████████████████████████ |
+| L4 tetraploid | 162 | ██████████ |
+| L6 hexaploid | 47 | ███ |
+| L3 triploid | 16 | █ |
+| L8 octoploid | 11 | ▊ |
+| L10 decaploid | 5 | ▍ |
+| L1 haploid | 3 | ▎ |
+| L5 pentaploid | 2 | ▏ |
 
 ## How it works
 
-```
-accession
-   │
-   ▼
-fetch.py     NCBI Datasets + Entrez elink + BioProject + Europe PMC
-   │           -> assembly metadata + linked paper(s) + supplementary files
-   ▼
-parse.py     full-text XML / abstract / supplementary -> sections + chunks
-   │
-   ├──────────────► extract.py   rule-based extraction (regex, section weights, title)
-   │                                   │
-   ├──────────────► search.py    vector search (PubMedBERT) + ensemble
-   │                                   │
-   └──────────────► gemma.py     optional local Gemma-3 (grounded LLM extraction)
-                                       │
-                                       ▼
-                     pipeline.py   final metadata (value + confidence + method)
+```mermaid
+flowchart TD
+  A["NCBI assembly accession"] --> B["fetch<br>NCBI Datasets + BioProject + Europe PMC<br>+ supplementary files"]
+  B --> C["parse<br>full text / abstract / supplementary to sections"]
+  C --> D["extract<br>rule-based (INSDC 4-tuple)"]
+  C --> E["search<br>BM25 + PubMedBERT vector ensemble"]
+  C --> F["gemma<br>local Gemma-3 LLM (optional)"]
+  D --> G["pipeline<br>ensemble to final metadata"]
+  E --> G
+  F --> G
 ```
 
 All modules live at the repository root; `pipeline.py` orchestrates them and is
